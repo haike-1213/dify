@@ -1,28 +1,28 @@
 import logging
-import os
 import threading
 import uuid
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from typing import Any, Literal, Union, overload
 
-from flask import Flask, current_app
+from flask import Flask, copy_current_request_context, current_app
 from pydantic import ValidationError
 
+from configs import dify_config
 from core.app.app_config.easy_ui_based_app.model_config.converter import ModelConfigConverter
 from core.app.app_config.features.file_upload.manager import FileUploadConfigManager
-from core.app.apps.base_app_queue_manager import AppQueueManager, GenerateTaskStoppedError, PublishFrom
+from core.app.apps.base_app_queue_manager import AppQueueManager, PublishFrom
 from core.app.apps.completion.app_config_manager import CompletionAppConfigManager
 from core.app.apps.completion.app_runner import CompletionAppRunner
 from core.app.apps.completion.generate_response_converter import CompletionAppGenerateResponseConverter
+from core.app.apps.exc import GenerateTaskStoppedError
 from core.app.apps.message_based_app_generator import MessageBasedAppGenerator
 from core.app.apps.message_based_app_queue_manager import MessageBasedAppQueueManager
 from core.app.entities.app_invoke_entities import CompletionAppGenerateEntity, InvokeFrom
-from core.file.message_file_parser import MessageFileParser
-from core.model_runtime.errors.invoke import InvokeAuthorizationError, InvokeError
+from core.model_runtime.errors.invoke import InvokeAuthorizationError
 from core.ops.ops_trace_manager import TraceQueueManager
 from extensions.ext_database import db
-from models.account import Account
-from models.model import App, EndUser, Message
+from factories import file_factory
+from models import Account, App, EndUser, Message
 from services.errors.app import MoreLikeThisDisabledError
 from services.errors.message import MessageNotExistsError
 
@@ -35,24 +35,39 @@ class CompletionAppGenerator(MessageBasedAppGenerator):
         self,
         app_model: App,
         user: Union[Account, EndUser],
-        args: dict,
+        args: Mapping[str, Any],
         invoke_from: InvokeFrom,
-        stream: Literal[True] = True,
-    ) -> Generator[str, None, None]: ...
+        streaming: Literal[True],
+    ) -> Generator[str | Mapping[str, Any], None, None]: ...
 
     @overload
     def generate(
         self,
         app_model: App,
         user: Union[Account, EndUser],
-        args: dict,
+        args: Mapping[str, Any],
         invoke_from: InvokeFrom,
-        stream: Literal[False] = False,
-    ) -> dict: ...
+        streaming: Literal[False],
+    ) -> Mapping[str, Any]: ...
+
+    @overload
+    def generate(
+        self,
+        app_model: App,
+        user: Union[Account, EndUser],
+        args: Mapping[str, Any],
+        invoke_from: InvokeFrom,
+        streaming: bool = False,
+    ) -> Union[Mapping[str, Any], Generator[str | Mapping[str, Any], None, None]]: ...
 
     def generate(
-        self, app_model: App, user: Union[Account, EndUser], args: Any, invoke_from: InvokeFrom, stream: bool = True
-    ) -> Union[dict, Generator[str, None, None]]:
+        self,
+        app_model: App,
+        user: Union[Account, EndUser],
+        args: Mapping[str, Any],
+        invoke_from: InvokeFrom,
+        streaming: bool = True,
+    ) -> Union[Mapping[str, Any], Generator[str | Mapping[str, Any], None, None]]:
         """
         Generate App response.
 
@@ -60,7 +75,7 @@ class CompletionAppGenerator(MessageBasedAppGenerator):
         :param user: account or end user
         :param args: request args
         :param invoke_from: invoke from source
-        :param stream: is stream
+        :param streaming: is stream
         """
         query = args["query"]
         if not isinstance(query, str):
@@ -68,8 +83,6 @@ class CompletionAppGenerator(MessageBasedAppGenerator):
 
         query = query.replace("\x00", "")
         inputs = args["inputs"]
-
-        extras = {}
 
         # get conversation
         conversation = None
@@ -85,15 +98,23 @@ class CompletionAppGenerator(MessageBasedAppGenerator):
 
             # validate config
             override_model_config_dict = CompletionAppConfigManager.config_validate(
-                tenant_id=app_model.tenant_id, config=args.get("model_config")
+                tenant_id=app_model.tenant_id, config=args.get("model_config", {})
             )
 
         # parse files
+        # TODO(QuantumGhost): Move file parsing logic to the API controller layer
+        # for better separation of concerns.
+        #
+        # For implementation reference, see the `_parse_file` function and
+        # `DraftWorkflowNodeRunApi` class which handle this properly.
         files = args["files"] if args.get("files") else []
-        message_file_parser = MessageFileParser(tenant_id=app_model.tenant_id, app_id=app_model.id)
         file_extra_config = FileUploadConfigManager.convert(override_model_config_dict or app_model_config.to_dict())
         if file_extra_config:
-            file_objs = message_file_parser.validate_and_transform_files_arg(files, file_extra_config, user)
+            file_objs = file_factory.build_from_mappings(
+                mappings=files,
+                tenant_id=app_model.tenant_id,
+                config=file_extra_config,
+            )
         else:
             file_objs = []
 
@@ -110,13 +131,16 @@ class CompletionAppGenerator(MessageBasedAppGenerator):
             task_id=str(uuid.uuid4()),
             app_config=app_config,
             model_conf=ModelConfigConverter.convert(app_config),
-            inputs=self._get_cleaned_inputs(inputs, app_config),
+            file_upload_config=file_extra_config,
+            inputs=self._prepare_user_inputs(
+                user_inputs=inputs, variables=app_config.variables, tenant_id=app_model.tenant_id
+            ),
             query=query,
-            files=file_objs,
+            files=list(file_objs),
             user_id=user.id,
-            stream=stream,
+            stream=streaming,
             invoke_from=invoke_from,
-            extras=extras,
+            extras={},
             trace_manager=trace_manager,
         )
 
@@ -133,16 +157,17 @@ class CompletionAppGenerator(MessageBasedAppGenerator):
             message_id=message.id,
         )
 
-        # new thread
-        worker_thread = threading.Thread(
-            target=self._generate_worker,
-            kwargs={
-                "flask_app": current_app._get_current_object(),
-                "application_generate_entity": application_generate_entity,
-                "queue_manager": queue_manager,
-                "message_id": message.id,
-            },
-        )
+        # new thread with request context
+        @copy_current_request_context
+        def worker_with_context():
+            return self._generate_worker(
+                flask_app=current_app._get_current_object(),  # type: ignore
+                application_generate_entity=application_generate_entity,
+                queue_manager=queue_manager,
+                message_id=message.id,
+            )
+
+        worker_thread = threading.Thread(target=worker_with_context)
 
         worker_thread.start()
 
@@ -153,7 +178,7 @@ class CompletionAppGenerator(MessageBasedAppGenerator):
             conversation=conversation,
             message=message,
             user=user,
-            stream=stream,
+            stream=streaming,
         )
 
         return CompletionAppGenerateResponseConverter.convert(response=response, invoke_from=invoke_from)
@@ -194,8 +219,8 @@ class CompletionAppGenerator(MessageBasedAppGenerator):
             except ValidationError as e:
                 logger.exception("Validation Error when generating")
                 queue_manager.publish_error(e, PublishFrom.APPLICATION_MANAGER)
-            except (ValueError, InvokeError) as e:
-                if os.environ.get("DEBUG") and os.environ.get("DEBUG").lower() == "true":
+            except ValueError as e:
+                if dify_config.DEBUG:
                     logger.exception("Error when generating")
                 queue_manager.publish_error(e, PublishFrom.APPLICATION_MANAGER)
             except Exception as e:
@@ -211,7 +236,7 @@ class CompletionAppGenerator(MessageBasedAppGenerator):
         user: Union[Account, EndUser],
         invoke_from: InvokeFrom,
         stream: bool = True,
-    ) -> Union[dict, Generator[str, None, None]]:
+    ) -> Union[Mapping, Generator[Mapping | str, None, None]]:
         """
         Generate App response.
 
@@ -223,7 +248,7 @@ class CompletionAppGenerator(MessageBasedAppGenerator):
         """
         message = (
             db.session.query(Message)
-            .filter(
+            .where(
                 Message.id == message_id,
                 Message.app_id == app_model.id,
                 Message.from_source == ("api" if isinstance(user, EndUser) else "console"),
@@ -251,10 +276,13 @@ class CompletionAppGenerator(MessageBasedAppGenerator):
         override_model_config_dict["model"] = model_dict
 
         # parse files
-        message_file_parser = MessageFileParser(tenant_id=app_model.tenant_id, app_id=app_model.id)
-        file_extra_config = FileUploadConfigManager.convert(override_model_config_dict or app_model_config.to_dict())
+        file_extra_config = FileUploadConfigManager.convert(override_model_config_dict)
         if file_extra_config:
-            file_objs = message_file_parser.validate_and_transform_files_arg(message.files, file_extra_config, user)
+            file_objs = file_factory.build_from_mappings(
+                mappings=message.message_files,
+                tenant_id=app_model.tenant_id,
+                config=file_extra_config,
+            )
         else:
             file_objs = []
 
@@ -270,7 +298,7 @@ class CompletionAppGenerator(MessageBasedAppGenerator):
             model_conf=ModelConfigConverter.convert(app_config),
             inputs=message.inputs,
             query=message.query,
-            files=file_objs,
+            files=list(file_objs),
             user_id=user.id,
             stream=stream,
             invoke_from=invoke_from,
@@ -290,16 +318,17 @@ class CompletionAppGenerator(MessageBasedAppGenerator):
             message_id=message.id,
         )
 
-        # new thread
-        worker_thread = threading.Thread(
-            target=self._generate_worker,
-            kwargs={
-                "flask_app": current_app._get_current_object(),
-                "application_generate_entity": application_generate_entity,
-                "queue_manager": queue_manager,
-                "message_id": message.id,
-            },
-        )
+        # new thread with request context
+        @copy_current_request_context
+        def worker_with_context():
+            return self._generate_worker(
+                flask_app=current_app._get_current_object(),  # type: ignore
+                application_generate_entity=application_generate_entity,
+                queue_manager=queue_manager,
+                message_id=message.id,
+            )
+
+        worker_thread = threading.Thread(target=worker_with_context)
 
         worker_thread.start()
 

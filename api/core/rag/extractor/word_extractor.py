@@ -14,10 +14,12 @@ import requests
 from docx import Document as DocxDocument
 
 from configs import dify_config
+from core.helper import ssrf_proxy
 from core.rag.extractor.extractor_base import BaseExtractor
 from core.rag.models.document import Document
 from extensions.ext_database import db
 from extensions.ext_storage import storage
+from models.enums import CreatorUserRole
 from models.model import UploadFile
 
 logger = logging.getLogger(__name__)
@@ -25,7 +27,6 @@ logger = logging.getLogger(__name__)
 
 class WordExtractor(BaseExtractor):
     """Load docx files.
-
 
     Args:
         file_path: Path to the file to load.
@@ -49,7 +50,7 @@ class WordExtractor(BaseExtractor):
 
             self.web_path = self.file_path
             # TODO: use a better way to handle the file
-            self.temp_file = tempfile.NamedTemporaryFile()  # noqa: SIM115
+            self.temp_file = tempfile.NamedTemporaryFile()  # noqa SIM115
             self.temp_file.write(r.content)
             self.file_path = self.temp_file.name
         elif not os.path.isfile(self.file_path):
@@ -75,8 +76,7 @@ class WordExtractor(BaseExtractor):
         parsed = urlparse(url)
         return bool(parsed.netloc) and bool(parsed.scheme)
 
-    def _extract_images_from_docx(self, doc, image_folder):
-        os.makedirs(image_folder, exist_ok=True)
+    def _extract_images_from_docx(self, doc):
         image_count = 0
         image_map = {}
 
@@ -84,10 +84,12 @@ class WordExtractor(BaseExtractor):
             if "image" in rel.target_ref:
                 image_count += 1
                 if rel.is_external:
-                    url = rel.reltype
-                    response = requests.get(url, stream=True)
+                    url = rel.target_ref
+                    response = ssrf_proxy.get(url)
                     if response.status_code == 200:
                         image_ext = mimetypes.guess_extension(response.headers["Content-Type"])
+                        if image_ext is None:
+                            continue
                         file_uuid = str(uuid.uuid4())
                         file_key = "image_files/" + self.tenant_id + "/" + file_uuid + "." + image_ext
                         mime_type, _ = mimetypes.guess_type(file_key)
@@ -96,6 +98,8 @@ class WordExtractor(BaseExtractor):
                         continue
                 else:
                     image_ext = rel.target_ref.split(".")[-1]
+                    if image_ext is None:
+                        continue
                     # user uuid as file name
                     file_uuid = str(uuid.uuid4())
                     file_key = "image_files/" + self.tenant_id + "/" + file_uuid + "." + image_ext
@@ -109,20 +113,19 @@ class WordExtractor(BaseExtractor):
                     key=file_key,
                     name=file_key,
                     size=0,
-                    extension=image_ext,
-                    mime_type=mime_type,
+                    extension=str(image_ext),
+                    mime_type=mime_type or "",
                     created_by=self.user_id,
-                    created_at=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
+                    created_by_role=CreatorUserRole.ACCOUNT,
+                    created_at=datetime.datetime.now(datetime.UTC).replace(tzinfo=None),
                     used=True,
                     used_by=self.user_id,
-                    used_at=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
+                    used_at=datetime.datetime.now(datetime.UTC).replace(tzinfo=None),
                 )
 
                 db.session.add(upload_file)
                 db.session.commit()
-                image_map[rel.target_part] = (
-                    f"![image]({dify_config.CONSOLE_API_URL}/files/{upload_file.id}/image-preview)"
-                )
+                image_map[rel.target_part] = f"![image]({dify_config.FILES_URL}/files/{upload_file.id}/file-preview)"
 
         return image_map
 
@@ -206,7 +209,7 @@ class WordExtractor(BaseExtractor):
 
         content = []
 
-        image_map = self._extract_images_from_docx(doc, image_folder)
+        image_map = self._extract_images_from_docx(doc)
 
         hyperlinks_url = None
         url_pattern = re.compile(r"http://[^\s+]+//|https://[^\s+]+")
@@ -221,21 +224,25 @@ class WordExtractor(BaseExtractor):
                         xml = ElementTree.XML(run.element.xml)
                         x_child = [c for c in xml.iter() if c is not None]
                         for x in x_child:
-                            if x_child is None:
+                            if x is None:
                                 continue
                             if x.tag.endswith("instrText"):
+                                if x.text is None:
+                                    continue
                                 for i in url_pattern.findall(x.text):
                                     hyperlinks_url = str(i)
-                    except Exception as e:
-                        logger.error(e)
+                    except Exception:
+                        logger.exception("Failed to parse HYPERLINK xml")
 
         def parse_paragraph(paragraph):
             paragraph_content = []
             for run in paragraph.runs:
-                if hasattr(run.element, "tag") and isinstance(element.tag, str) and run.element.tag.endswith("r"):
+                if hasattr(run.element, "tag") and isinstance(run.element.tag, str) and run.element.tag.endswith("r"):
+                    # Process drawing type images
                     drawing_elements = run.element.findall(
                         ".//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}drawing"
                     )
+                    has_drawing = False
                     for drawing in drawing_elements:
                         blip_elements = drawing.findall(
                             ".//{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
@@ -247,6 +254,34 @@ class WordExtractor(BaseExtractor):
                             if embed_id:
                                 image_part = doc.part.related_parts.get(embed_id)
                                 if image_part in image_map:
+                                    has_drawing = True
+                                    paragraph_content.append(image_map[image_part])
+                    # Process pict type images
+                    shape_elements = run.element.findall(
+                        ".//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}pict"
+                    )
+                    for shape in shape_elements:
+                        # Find image data in VML
+                        shape_image = shape.find(
+                            ".//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}binData"
+                        )
+                        if shape_image is not None and shape_image.text:
+                            image_id = shape_image.get(
+                                "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+                            )
+                            if image_id and image_id in doc.part.rels:
+                                image_part = doc.part.rels[image_id].target_part
+                                if image_part in image_map and not has_drawing:
+                                    paragraph_content.append(image_map[image_part])
+                        # Find imagedata element in VML
+                        image_data = shape.find(".//{urn:schemas-microsoft-com:vml}imagedata")
+                        if image_data is not None:
+                            image_id = image_data.get("id") or image_data.get(
+                                "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+                            )
+                            if image_id and image_id in doc.part.rels:
+                                image_part = doc.part.rels[image_id].target_part
+                                if image_part in image_map and not has_drawing:
                                     paragraph_content.append(image_map[image_part])
                 if run.text.strip():
                     paragraph_content.append(run.text.strip())
@@ -259,8 +294,10 @@ class WordExtractor(BaseExtractor):
                 if isinstance(element.tag, str) and element.tag.endswith("p"):  # paragraph
                     para = paragraphs.pop(0)
                     parsed_paragraph = parse_paragraph(para)
-                    if parsed_paragraph:
+                    if parsed_paragraph.strip():
                         content.append(parsed_paragraph)
+                    else:
+                        content.append("\n")
                 elif isinstance(element.tag, str) and element.tag.endswith("tbl"):  # table
                     table = tables.pop(0)
                     content.append(self._table_to_markdown(table, image_map))

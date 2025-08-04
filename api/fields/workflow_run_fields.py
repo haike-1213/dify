@@ -14,11 +14,11 @@ workflow_run_for_log_fields = {
     "total_steps": fields.Integer,
     "created_at": TimestampField,
     "finished_at": TimestampField,
+    "exceptions_count": fields.Integer,
 }
 
 workflow_run_for_list_fields = {
     "id": fields.String,
-    "sequence_number": fields.Integer,
     "version": fields.String,
     "status": fields.String,
     "elapsed_time": fields.Float,
@@ -27,13 +27,14 @@ workflow_run_for_list_fields = {
     "created_by_account": fields.Nested(simple_account_fields, attribute="created_by_account", allow_null=True),
     "created_at": TimestampField,
     "finished_at": TimestampField,
+    "exceptions_count": fields.Integer,
+    "retry_index": fields.Integer,
 }
 
 advanced_chat_workflow_run_for_list_fields = {
     "id": fields.String,
     "conversation_id": fields.String,
     "message_id": fields.String,
-    "sequence_number": fields.Integer,
     "version": fields.String,
     "status": fields.String,
     "elapsed_time": fields.Float,
@@ -42,6 +43,8 @@ advanced_chat_workflow_run_for_list_fields = {
     "created_by_account": fields.Nested(simple_account_fields, attribute="created_by_account", allow_null=True),
     "created_at": TimestampField,
     "finished_at": TimestampField,
+    "exceptions_count": fields.Integer,
+    "retry_index": fields.Integer,
 }
 
 advanced_chat_workflow_run_pagination_fields = {
@@ -58,7 +61,6 @@ workflow_run_pagination_fields = {
 
 workflow_run_detail_fields = {
     "id": fields.String,
-    "sequence_number": fields.Integer,
     "version": fields.String,
     "graph": fields.Raw(attribute="graph_dict"),
     "inputs": fields.Raw(attribute="inputs_dict"),
@@ -73,7 +75,21 @@ workflow_run_detail_fields = {
     "created_by_end_user": fields.Nested(simple_end_user_fields, attribute="created_by_end_user", allow_null=True),
     "created_at": TimestampField,
     "finished_at": TimestampField,
+    "exceptions_count": fields.Integer,
 }
+
+retry_event_field = {
+    "elapsed_time": fields.Float,
+    "status": fields.String,
+    "inputs": fields.Raw(attribute="inputs"),
+    "process_data": fields.Raw(attribute="process_data"),
+    "outputs": fields.Raw(attribute="outputs"),
+    "metadata": fields.Raw(attribute="metadata"),
+    "llm_usage": fields.Raw(attribute="llm_usage"),
+    "error": fields.String,
+    "retry_index": fields.Integer,
+}
+
 
 workflow_run_node_execution_fields = {
     "id": fields.String,

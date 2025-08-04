@@ -1,8 +1,9 @@
+from collections.abc import Mapping
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_serializer, field_validator
 
 
 class BaseTraceInfo(BaseModel):
@@ -13,6 +14,7 @@ class BaseTraceInfo(BaseModel):
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
     metadata: dict[str, Any]
+    trace_id: Optional[str] = None
 
     @field_validator("inputs", "outputs")
     @classmethod
@@ -22,6 +24,14 @@ class BaseTraceInfo(BaseModel):
         if isinstance(v, str | dict | list):
             return v
         return ""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    @field_serializer("start_time", "end_time")
+    def serialize_datetime(self, dt: datetime | None) -> str | None:
+        if dt is None:
+            return None
+        return dt.isoformat()
 
 
 class WorkflowTraceInfo(BaseTraceInfo):
@@ -33,8 +43,8 @@ class WorkflowTraceInfo(BaseTraceInfo):
     workflow_run_id: str
     workflow_run_elapsed_time: Union[int, float]
     workflow_run_status: str
-    workflow_run_inputs: dict[str, Any]
-    workflow_run_outputs: dict[str, Any]
+    workflow_run_inputs: Mapping[str, Any]
+    workflow_run_outputs: Mapping[str, Any]
     workflow_run_version: str
     error: Optional[str] = None
     total_tokens: int
@@ -100,6 +110,12 @@ class GenerateNameTraceInfo(BaseTraceInfo):
     tenant_id: str
 
 
+class TaskData(BaseModel):
+    app_id: str
+    trace_info_type: str
+    trace_info: Any
+
+
 trace_info_info_map = {
     "WorkflowTraceInfo": WorkflowTraceInfo,
     "MessageTraceInfo": MessageTraceInfo,
@@ -111,7 +127,7 @@ trace_info_info_map = {
 }
 
 
-class TraceTaskName(str, Enum):
+class TraceTaskName(StrEnum):
     CONVERSATION_TRACE = "conversation"
     WORKFLOW_TRACE = "workflow"
     MESSAGE_TRACE = "message"

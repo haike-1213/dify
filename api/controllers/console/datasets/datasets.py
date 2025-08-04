@@ -10,11 +10,16 @@ from controllers.console import api
 from controllers.console.apikey import api_key_fields, api_key_list
 from controllers.console.app.error import ProviderNotInitializeError
 from controllers.console.datasets.error import DatasetInUseError, DatasetNameDuplicateError, IndexingEstimateError
-from controllers.console.setup import setup_required
-from controllers.console.wraps import account_initialization_required
+from controllers.console.wraps import (
+    account_initialization_required,
+    cloud_edition_billing_rate_limit_check,
+    enterprise_license_required,
+    setup_required,
+)
 from core.errors.error import LLMBadRequestError, ProviderTokenNotInitError
 from core.indexing_runner import IndexingRunner
 from core.model_runtime.entities.model_entities import ModelType
+from core.plugin.entities.plugin import ModelProviderID
 from core.provider_manager import ProviderManager
 from core.rag.datasource.vdb.vector_type import VectorType
 from core.rag.extractor.entity.extract_setting import ExtractSetting
@@ -24,8 +29,8 @@ from fields.app_fields import related_app_list
 from fields.dataset_fields import dataset_detail_fields, dataset_query_detail_fields
 from fields.document_fields import document_status_fields
 from libs.login import login_required
-from models.dataset import Dataset, DatasetPermissionEnum, Document, DocumentSegment
-from models.model import ApiToken, UploadFile
+from models import ApiToken, Dataset, Document, DocumentSegment, UploadFile
+from models.dataset import DatasetPermissionEnum
 from services.dataset_service import DatasetPermissionService, DatasetService, DocumentService
 
 
@@ -45,19 +50,20 @@ class DatasetListApi(Resource):
     @setup_required
     @login_required
     @account_initialization_required
+    @enterprise_license_required
     def get(self):
         page = request.args.get("page", default=1, type=int)
         limit = request.args.get("limit", default=20, type=int)
         ids = request.args.getlist("ids")
-        provider = request.args.get("provider", default="vendor")
+        # provider = request.args.get("provider", default="vendor")
         search = request.args.get("keyword", default=None, type=str)
         tag_ids = request.args.getlist("tag_ids")
-
+        include_all = request.args.get("include_all", default="false").lower() == "true"
         if ids:
             datasets, total = DatasetService.get_datasets_by_ids(ids, current_user.current_tenant_id)
         else:
             datasets, total = DatasetService.get_datasets(
-                page, limit, provider, current_user.current_tenant_id, current_user, search, tag_ids
+                page, limit, current_user.current_tenant_id, current_user, search, tag_ids, include_all
             )
 
         # check embedding setting
@@ -72,7 +78,9 @@ class DatasetListApi(Resource):
 
         data = marshal(datasets, dataset_detail_fields)
         for item in data:
-            if item["indexing_technique"] == "high_quality":
+            # convert embedding_model_provider to plugin standard format
+            if item["indexing_technique"] == "high_quality" and item["embedding_model_provider"]:
+                item["embedding_model_provider"] = str(ModelProviderID(item["embedding_model_provider"]))
                 item_model = f"{item['embedding_model']}:{item['embedding_model_provider']}"
                 if item_model in model_names:
                     item["embedding_available"] = True
@@ -93,6 +101,7 @@ class DatasetListApi(Resource):
     @setup_required
     @login_required
     @account_initialization_required
+    @cloud_edition_billing_rate_limit_check("knowledge")
     def post(self):
         parser = reqparse.RequestParser()
         parser.add_argument(
@@ -103,12 +112,39 @@ class DatasetListApi(Resource):
             type=_validate_name,
         )
         parser.add_argument(
+            "description",
+            type=str,
+            nullable=True,
+            required=False,
+            default="",
+        )
+        parser.add_argument(
             "indexing_technique",
             type=str,
             location="json",
             choices=Dataset.INDEXING_TECHNIQUE_LIST,
             nullable=True,
             help="Invalid indexing technique.",
+        )
+        parser.add_argument(
+            "external_knowledge_api_id",
+            type=str,
+            nullable=True,
+            required=False,
+        )
+        parser.add_argument(
+            "provider",
+            type=str,
+            nullable=True,
+            choices=Dataset.PROVIDER_LIST,
+            required=False,
+            default="vendor",
+        )
+        parser.add_argument(
+            "external_knowledge_id",
+            type=str,
+            nullable=True,
+            required=False,
         )
         args = parser.parse_args()
 
@@ -120,9 +156,13 @@ class DatasetListApi(Resource):
             dataset = DatasetService.create_empty_dataset(
                 tenant_id=current_user.current_tenant_id,
                 name=args["name"],
+                description=args["description"],
                 indexing_technique=args["indexing_technique"],
                 account=current_user,
                 permission=DatasetPermissionEnum.ONLY_ME,
+                provider=args["provider"],
+                external_knowledge_api_id=args["external_knowledge_api_id"],
+                external_knowledge_id=args["external_knowledge_id"],
             )
         except services.errors.dataset.DatasetNameDuplicateError:
             raise DatasetNameDuplicateError()
@@ -144,6 +184,10 @@ class DatasetApi(Resource):
         except services.errors.account.NoPermissionError as e:
             raise Forbidden(str(e))
         data = marshal(dataset, dataset_detail_fields)
+        if dataset.indexing_technique == "high_quality":
+            if dataset.embedding_model_provider:
+                provider_id = ModelProviderID(dataset.embedding_model_provider)
+                data["embedding_model_provider"] = str(provider_id)
         if data.get("permission") == "partial_members":
             part_users_list = DatasetPermissionService.get_dataset_partial_member_list(dataset_id_str)
             data.update({"partial_member_list": part_users_list})
@@ -167,15 +211,12 @@ class DatasetApi(Resource):
         else:
             data["embedding_available"] = True
 
-        if data.get("permission") == "partial_members":
-            part_users_list = DatasetPermissionService.get_dataset_partial_member_list(dataset_id_str)
-            data.update({"partial_member_list": part_users_list})
-
         return data, 200
 
     @setup_required
     @login_required
     @account_initialization_required
+    @cloud_edition_billing_rate_limit_check("knowledge")
     def patch(self, dataset_id):
         dataset_id_str = str(dataset_id)
         dataset = DatasetService.get_dataset(dataset_id_str)
@@ -211,11 +252,42 @@ class DatasetApi(Resource):
         )
         parser.add_argument("retrieval_model", type=dict, location="json", help="Invalid retrieval model.")
         parser.add_argument("partial_member_list", type=list, location="json", help="Invalid parent user list.")
+
+        parser.add_argument(
+            "external_retrieval_model",
+            type=dict,
+            required=False,
+            nullable=True,
+            location="json",
+            help="Invalid external retrieval model.",
+        )
+
+        parser.add_argument(
+            "external_knowledge_id",
+            type=str,
+            required=False,
+            nullable=True,
+            location="json",
+            help="Invalid external knowledge id.",
+        )
+
+        parser.add_argument(
+            "external_knowledge_api_id",
+            type=str,
+            required=False,
+            nullable=True,
+            location="json",
+            help="Invalid external knowledge api id.",
+        )
         args = parser.parse_args()
         data = request.get_json()
 
         # check embedding model setting
-        if data.get("indexing_technique") == "high_quality":
+        if (
+            data.get("indexing_technique") == "high_quality"
+            and data.get("embedding_model_provider") is not None
+            and data.get("embedding_model") is not None
+        ):
             DatasetService.check_embedding_model_setting(
                 dataset.tenant_id, data.get("embedding_model_provider"), data.get("embedding_model")
             )
@@ -252,6 +324,7 @@ class DatasetApi(Resource):
     @setup_required
     @login_required
     @account_initialization_required
+    @cloud_edition_billing_rate_limit_check("knowledge")
     def delete(self, dataset_id):
         dataset_id_str = str(dataset_id)
 
@@ -339,7 +412,7 @@ class DatasetIndexingEstimateApi(Resource):
             file_ids = args["info_list"]["file_info_list"]["file_ids"]
             file_details = (
                 db.session.query(UploadFile)
-                .filter(UploadFile.tenant_id == current_user.current_tenant_id, UploadFile.id.in_(file_ids))
+                .where(UploadFile.tenant_id == current_user.current_tenant_id, UploadFile.id.in_(file_ids))
                 .all()
             )
 
@@ -406,7 +479,7 @@ class DatasetIndexingEstimateApi(Resource):
         except Exception as e:
             raise IndexingEstimateError(str(e))
 
-        return response, 200
+        return response.model_dump(), 200
 
 
 class DatasetRelatedAppListApi(Resource):
@@ -444,22 +517,41 @@ class DatasetIndexingStatusApi(Resource):
         dataset_id = str(dataset_id)
         documents = (
             db.session.query(Document)
-            .filter(Document.dataset_id == dataset_id, Document.tenant_id == current_user.current_tenant_id)
+            .where(Document.dataset_id == dataset_id, Document.tenant_id == current_user.current_tenant_id)
             .all()
         )
         documents_status = []
         for document in documents:
-            completed_segments = DocumentSegment.query.filter(
-                DocumentSegment.completed_at.isnot(None),
-                DocumentSegment.document_id == str(document.id),
-                DocumentSegment.status != "re_segment",
-            ).count()
-            total_segments = DocumentSegment.query.filter(
-                DocumentSegment.document_id == str(document.id), DocumentSegment.status != "re_segment"
-            ).count()
-            document.completed_segments = completed_segments
-            document.total_segments = total_segments
-            documents_status.append(marshal(document, document_status_fields))
+            completed_segments = (
+                db.session.query(DocumentSegment)
+                .where(
+                    DocumentSegment.completed_at.isnot(None),
+                    DocumentSegment.document_id == str(document.id),
+                    DocumentSegment.status != "re_segment",
+                )
+                .count()
+            )
+            total_segments = (
+                db.session.query(DocumentSegment)
+                .where(DocumentSegment.document_id == str(document.id), DocumentSegment.status != "re_segment")
+                .count()
+            )
+            # Create a dictionary with document attributes and additional fields
+            document_dict = {
+                "id": document.id,
+                "indexing_status": document.indexing_status,
+                "processing_started_at": document.processing_started_at,
+                "parsing_completed_at": document.parsing_completed_at,
+                "cleaning_completed_at": document.cleaning_completed_at,
+                "splitting_completed_at": document.splitting_completed_at,
+                "completed_at": document.completed_at,
+                "paused_at": document.paused_at,
+                "error": document.error,
+                "stopped_at": document.stopped_at,
+                "completed_segments": completed_segments,
+                "total_segments": total_segments,
+            }
+            documents_status.append(marshal(document_dict, document_status_fields))
         data = {"data": documents_status}
         return data
 
@@ -476,7 +568,7 @@ class DatasetApiKeyApi(Resource):
     def get(self):
         keys = (
             db.session.query(ApiToken)
-            .filter(ApiToken.type == self.resource_type, ApiToken.tenant_id == current_user.current_tenant_id)
+            .where(ApiToken.type == self.resource_type, ApiToken.tenant_id == current_user.current_tenant_id)
             .all()
         )
         return {"items": keys}
@@ -492,7 +584,7 @@ class DatasetApiKeyApi(Resource):
 
         current_key_count = (
             db.session.query(ApiToken)
-            .filter(ApiToken.type == self.resource_type, ApiToken.tenant_id == current_user.current_tenant_id)
+            .where(ApiToken.type == self.resource_type, ApiToken.tenant_id == current_user.current_tenant_id)
             .count()
         )
 
@@ -528,7 +620,7 @@ class DatasetApiDeleteApi(Resource):
 
         key = (
             db.session.query(ApiToken)
-            .filter(
+            .where(
                 ApiToken.tenant_id == current_user.current_tenant_id,
                 ApiToken.type == self.resource_type,
                 ApiToken.id == api_key_id,
@@ -539,7 +631,7 @@ class DatasetApiDeleteApi(Resource):
         if key is None:
             flask_restful.abort(404, message="API key not found")
 
-        db.session.query(ApiToken).filter(ApiToken.id == api_key_id).delete()
+        db.session.query(ApiToken).where(ApiToken.id == api_key_id).delete()
         db.session.commit()
 
         return {"result": "success"}, 204
@@ -561,12 +653,13 @@ class DatasetRetrievalSettingApi(Resource):
         vector_type = dify_config.VECTOR_STORE
         match vector_type:
             case (
-                VectorType.MILVUS
-                | VectorType.RELYT
-                | VectorType.PGVECTOR
+                VectorType.RELYT
                 | VectorType.TIDB_VECTOR
                 | VectorType.CHROMA
-                | VectorType.TENCENT
+                | VectorType.PGVECTO_RS
+                | VectorType.BAIDU
+                | VectorType.VIKINGDB
+                | VectorType.UPSTASH
             ):
                 return {"retrieval_method": [RetrievalMethod.SEMANTIC_SEARCH.value]}
             case (
@@ -577,6 +670,19 @@ class DatasetRetrievalSettingApi(Resource):
                 | VectorType.MYSCALE
                 | VectorType.ORACLE
                 | VectorType.ELASTICSEARCH
+                | VectorType.ELASTICSEARCH_JA
+                | VectorType.PGVECTOR
+                | VectorType.VASTBASE
+                | VectorType.TIDB_ON_QDRANT
+                | VectorType.LINDORM
+                | VectorType.COUCHBASE
+                | VectorType.MILVUS
+                | VectorType.OPENGAUSS
+                | VectorType.OCEANBASE
+                | VectorType.TABLESTORE
+                | VectorType.HUAWEI_CLOUD
+                | VectorType.TENCENT
+                | VectorType.MATRIXONE
             ):
                 return {
                     "retrieval_method": [
@@ -600,8 +706,10 @@ class DatasetRetrievalSettingMockApi(Resource):
                 | VectorType.RELYT
                 | VectorType.TIDB_VECTOR
                 | VectorType.CHROMA
-                | VectorType.TENCENT
                 | VectorType.PGVECTO_RS
+                | VectorType.BAIDU
+                | VectorType.VIKINGDB
+                | VectorType.UPSTASH
             ):
                 return {"retrieval_method": [RetrievalMethod.SEMANTIC_SEARCH.value]}
             case (
@@ -612,7 +720,17 @@ class DatasetRetrievalSettingMockApi(Resource):
                 | VectorType.MYSCALE
                 | VectorType.ORACLE
                 | VectorType.ELASTICSEARCH
+                | VectorType.ELASTICSEARCH_JA
+                | VectorType.COUCHBASE
                 | VectorType.PGVECTOR
+                | VectorType.VASTBASE
+                | VectorType.LINDORM
+                | VectorType.OPENGAUSS
+                | VectorType.OCEANBASE
+                | VectorType.TABLESTORE
+                | VectorType.TENCENT
+                | VectorType.HUAWEI_CLOUD
+                | VectorType.MATRIXONE
             ):
                 return {
                     "retrieval_method": [
@@ -660,6 +778,18 @@ class DatasetPermissionUserListApi(Resource):
         }, 200
 
 
+class DatasetAutoDisableLogApi(Resource):
+    @setup_required
+    @login_required
+    @account_initialization_required
+    def get(self, dataset_id):
+        dataset_id_str = str(dataset_id)
+        dataset = DatasetService.get_dataset(dataset_id_str)
+        if dataset is None:
+            raise NotFound("Dataset not found.")
+        return DatasetService.get_dataset_auto_disable_logs(dataset_id_str), 200
+
+
 api.add_resource(DatasetListApi, "/datasets")
 api.add_resource(DatasetApi, "/datasets/<uuid:dataset_id>")
 api.add_resource(DatasetUseCheckApi, "/datasets/<uuid:dataset_id>/use-check")
@@ -674,3 +804,4 @@ api.add_resource(DatasetApiBaseUrlApi, "/datasets/api-base-info")
 api.add_resource(DatasetRetrievalSettingApi, "/datasets/retrieval-setting")
 api.add_resource(DatasetRetrievalSettingMockApi, "/datasets/retrieval-setting/<string:vector_type>")
 api.add_resource(DatasetPermissionUserListApi, "/datasets/<uuid:dataset_id>/permission-part-users")
+api.add_resource(DatasetAutoDisableLogApi, "/datasets/<uuid:dataset_id>/auto-disable-logs")

@@ -15,13 +15,11 @@ from controllers.console.app.error import (
     ProviderQuotaExceededError,
 )
 from controllers.console.app.wraps import get_app_model
-from controllers.console.setup import setup_required
-from controllers.console.wraps import account_initialization_required
+from controllers.console.wraps import account_initialization_required, setup_required
 from controllers.web.error import InvokeRateLimitError as InvokeRateLimitHttpError
 from core.app.apps.base_app_queue_manager import AppQueueManager
 from core.app.entities.app_invoke_entities import InvokeFrom
 from core.errors.error import (
-    AppInvokeQuotaExceededError,
     ModelCurrentlyNotSupportError,
     ProviderTokenNotInitError,
     QuotaExceededError,
@@ -77,7 +75,7 @@ class CompletionMessageApi(Resource):
             raise ProviderModelCurrentlyNotSupportError()
         except InvokeError as e:
             raise CompletionRequestError(e.description)
-        except (ValueError, AppInvokeQuotaExceededError) as e:
+        except ValueError as e:
             raise e
         except Exception as e:
             logging.exception("internal server error.")
@@ -142,7 +140,7 @@ class ChatMessageApi(Resource):
             raise InvokeRateLimitHttpError(ex.description)
         except InvokeError as e:
             raise CompletionRequestError(e.description)
-        except (ValueError, AppInvokeQuotaExceededError) as e:
+        except ValueError as e:
             raise e
         except Exception as e:
             logging.exception("internal server error.")

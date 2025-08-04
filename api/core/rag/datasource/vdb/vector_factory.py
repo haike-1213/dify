@@ -1,16 +1,21 @@
+import logging
+import time
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Optional
 
 from configs import dify_config
-from core.embedding.cached_embedding import CacheEmbedding
 from core.model_manager import ModelManager
 from core.model_runtime.entities.model_entities import ModelType
-from core.rag.datasource.entity.embedding import Embeddings
 from core.rag.datasource.vdb.vector_base import BaseVector
 from core.rag.datasource.vdb.vector_type import VectorType
+from core.rag.embedding.cached_embedding import CacheEmbedding
+from core.rag.embedding.embedding_base import Embeddings
 from core.rag.models.document import Document
+from extensions.ext_database import db
 from extensions.ext_redis import redis_client
-from models.dataset import Dataset
+from models.dataset import Dataset, Whitelist
+
+logger = logging.getLogger(__name__)
 
 
 class AbstractVectorFactory(ABC):
@@ -25,7 +30,7 @@ class AbstractVectorFactory(ABC):
 
 
 class Vector:
-    def __init__(self, dataset: Dataset, attributes: list = None):
+    def __init__(self, dataset: Dataset, attributes: Optional[list] = None):
         if attributes is None:
             attributes = ["doc_id", "dataset_id", "document_id", "doc_hash"]
         self._dataset = dataset
@@ -35,8 +40,18 @@ class Vector:
 
     def _init_vector(self) -> BaseVector:
         vector_type = dify_config.VECTOR_STORE
+
         if self._dataset.index_struct_dict:
             vector_type = self._dataset.index_struct_dict["type"]
+        else:
+            if dify_config.VECTOR_STORE_WHITELIST_ENABLE:
+                whitelist = (
+                    db.session.query(Whitelist)
+                    .where(Whitelist.tenant_id == self._dataset.tenant_id, Whitelist.category == "vector_db")
+                    .one_or_none()
+                )
+                if whitelist:
+                    vector_type = VectorType.TIDB_ON_QDRANT
 
         if not vector_type:
             raise ValueError("Vector store must be specified.")
@@ -63,6 +78,10 @@ class Vector:
                 from core.rag.datasource.vdb.pgvector.pgvector import PGVectorFactory
 
                 return PGVectorFactory
+            case VectorType.VASTBASE:
+                from core.rag.datasource.vdb.pyvastbase.vastbase_vector import VastbaseVectorFactory
+
+                return VastbaseVectorFactory
             case VectorType.PGVECTO_RS:
                 from core.rag.datasource.vdb.pgvecto_rs.pgvecto_rs import PGVectoRSFactory
 
@@ -79,6 +98,12 @@ class Vector:
                 from core.rag.datasource.vdb.elasticsearch.elasticsearch_vector import ElasticSearchVectorFactory
 
                 return ElasticSearchVectorFactory
+            case VectorType.ELASTICSEARCH_JA:
+                from core.rag.datasource.vdb.elasticsearch.elasticsearch_ja_vector import (
+                    ElasticSearchJaVectorFactory,
+                )
+
+                return ElasticSearchJaVectorFactory
             case VectorType.TIDB_VECTOR:
                 from core.rag.datasource.vdb.tidb_vector.tidb_vector import TiDBVectorFactory
 
@@ -103,13 +128,69 @@ class Vector:
                 from core.rag.datasource.vdb.analyticdb.analyticdb_vector import AnalyticdbVectorFactory
 
                 return AnalyticdbVectorFactory
+            case VectorType.COUCHBASE:
+                from core.rag.datasource.vdb.couchbase.couchbase_vector import CouchbaseVectorFactory
+
+                return CouchbaseVectorFactory
+            case VectorType.BAIDU:
+                from core.rag.datasource.vdb.baidu.baidu_vector import BaiduVectorFactory
+
+                return BaiduVectorFactory
+            case VectorType.VIKINGDB:
+                from core.rag.datasource.vdb.vikingdb.vikingdb_vector import VikingDBVectorFactory
+
+                return VikingDBVectorFactory
+            case VectorType.UPSTASH:
+                from core.rag.datasource.vdb.upstash.upstash_vector import UpstashVectorFactory
+
+                return UpstashVectorFactory
+            case VectorType.TIDB_ON_QDRANT:
+                from core.rag.datasource.vdb.tidb_on_qdrant.tidb_on_qdrant_vector import TidbOnQdrantVectorFactory
+
+                return TidbOnQdrantVectorFactory
+            case VectorType.LINDORM:
+                from core.rag.datasource.vdb.lindorm.lindorm_vector import LindormVectorStoreFactory
+
+                return LindormVectorStoreFactory
+            case VectorType.OCEANBASE:
+                from core.rag.datasource.vdb.oceanbase.oceanbase_vector import OceanBaseVectorFactory
+
+                return OceanBaseVectorFactory
+            case VectorType.OPENGAUSS:
+                from core.rag.datasource.vdb.opengauss.opengauss import OpenGaussFactory
+
+                return OpenGaussFactory
+            case VectorType.TABLESTORE:
+                from core.rag.datasource.vdb.tablestore.tablestore_vector import TableStoreVectorFactory
+
+                return TableStoreVectorFactory
+            case VectorType.HUAWEI_CLOUD:
+                from core.rag.datasource.vdb.huawei.huawei_cloud_vector import HuaweiCloudVectorFactory
+
+                return HuaweiCloudVectorFactory
+            case VectorType.MATRIXONE:
+                from core.rag.datasource.vdb.matrixone.matrixone_vector import MatrixoneVectorFactory
+
+                return MatrixoneVectorFactory
             case _:
                 raise ValueError(f"Vector store {vector_type} is not supported.")
 
-    def create(self, texts: list = None, **kwargs):
+    def create(self, texts: Optional[list] = None, **kwargs):
         if texts:
-            embeddings = self._embeddings.embed_documents([document.page_content for document in texts])
-            self._vector_processor.create(texts=texts, embeddings=embeddings, **kwargs)
+            start = time.time()
+            logger.info("start embedding %s texts %s", len(texts), start)
+            batch_size = 1000
+            total_batches = len(texts) + batch_size - 1
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i : i + batch_size]
+                batch_start = time.time()
+                logger.info("Processing batch %s/%s (%s texts)", i // batch_size + 1, total_batches, len(batch))
+                batch_embeddings = self._embeddings.embed_documents([document.page_content for document in batch])
+                logger.info(
+                    "Embedding batch %s/%s took %s s", i // batch_size + 1, total_batches, time.time() - batch_start
+                )
+                self._vector_processor.create(texts=batch, embeddings=batch_embeddings, **kwargs)
+            logger.info("Embedding %s texts took %s s", len(texts), time.time() - start)
 
     def add_texts(self, documents: list[Document], **kwargs):
         if kwargs.get("duplicate_check", False):
@@ -138,7 +219,7 @@ class Vector:
         self._vector_processor.delete()
         # delete collection redis cache
         if self._vector_processor.collection_name:
-            collection_exist_cache_key = "vector_indexing_{}".format(self._vector_processor.collection_name)
+            collection_exist_cache_key = f"vector_indexing_{self._vector_processor.collection_name}"
             redis_client.delete(collection_exist_cache_key)
 
     def _get_embeddings(self) -> Embeddings:
@@ -154,10 +235,13 @@ class Vector:
 
     def _filter_duplicate_texts(self, texts: list[Document]) -> list[Document]:
         for text in texts.copy():
+            if text.metadata is None:
+                continue
             doc_id = text.metadata["doc_id"]
-            exists_duplicate_node = self.text_exists(doc_id)
-            if exists_duplicate_node:
-                texts.remove(text)
+            if doc_id:
+                exists_duplicate_node = self.text_exists(doc_id)
+                if exists_duplicate_node:
+                    texts.remove(text)
 
         return texts
 

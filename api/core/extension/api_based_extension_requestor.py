@@ -1,3 +1,5 @@
+from typing import cast
+
 import requests
 
 from configs import dify_config
@@ -5,7 +7,7 @@ from models.api_based_extension import APIBasedExtensionPoint
 
 
 class APIBasedExtensionRequestor:
-    timeout: (int, int) = (5, 60)
+    timeout: tuple[int, int] = (5, 60)
     """timeout for request connect and read"""
 
     def __init__(self, api_endpoint: str, api_key: str) -> None:
@@ -20,7 +22,7 @@ class APIBasedExtensionRequestor:
         :param params: the request params
         :return: the response json
         """
-        headers = {"Content-Type": "application/json", "Authorization": "Bearer {}".format(self.api_key)}
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
 
         url = self.api_endpoint
 
@@ -47,8 +49,6 @@ class APIBasedExtensionRequestor:
             raise ValueError("request connection error")
 
         if response.status_code != 200:
-            raise ValueError(
-                "request error, status_code: {}, content: {}".format(response.status_code, response.text[:100])
-            )
+            raise ValueError(f"request error, status_code: {response.status_code}, content: {response.text[:100]}")
 
-        return response.json()
+        return cast(dict, response.json())

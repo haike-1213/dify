@@ -26,7 +26,7 @@ class AnnotationReplyFeature:
         :return:
         """
         annotation_setting = (
-            db.session.query(AppAnnotationSetting).filter(AppAnnotationSetting.app_id == app_record.id).first()
+            db.session.query(AppAnnotationSetting).where(AppAnnotationSetting.app_id == app_record.id).first()
         )
 
         if not annotation_setting:
@@ -58,7 +58,7 @@ class AnnotationReplyFeature:
                 query=query, top_k=1, score_threshold=score_threshold, filter={"group_id": [dataset.id]}
             )
 
-            if documents:
+            if documents and documents[0].metadata:
                 annotation_id = documents[0].metadata["annotation_id"]
                 score = documents[0].metadata["score"]
                 annotation = AppAnnotationService.get_annotation_by_id(annotation_id)
@@ -83,7 +83,7 @@ class AnnotationReplyFeature:
 
                     return annotation
         except Exception as e:
-            logger.warning(f"Query annotation failed, exception: {str(e)}.")
+            logger.warning("Query annotation failed, exception: %s.", str(e))
             return None
 
         return None

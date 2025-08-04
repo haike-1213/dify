@@ -1,13 +1,9 @@
 import {
   useCallback,
-  useEffect,
   useMemo,
-  useState,
 } from 'react'
-import dayjs from 'dayjs'
 import { uniqBy } from 'lodash-es'
 import { useTranslation } from 'react-i18next'
-import { useContext } from 'use-context-selector'
 import {
   getIncomers,
   getOutgoers,
@@ -34,29 +30,24 @@ import {
 } from '../utils'
 import {
   PARALLEL_DEPTH_LIMIT,
-  PARALLEL_LIMIT,
   SUPPORT_OUTPUT_VARS_NODE,
 } from '../constants'
 import { CUSTOM_NOTE_NODE } from '../note-node/constants'
 import { findUsedVarNodes, getNodeOutputVars, updateNodeVars } from '../nodes/_base/components/variable/utils'
 import { useNodesExtraData } from './use-nodes-data'
-import { useWorkflowTemplate } from './use-workflow-template'
 import { useStore as useAppStore } from '@/app/components/app/store'
-import {
-  fetchNodesDefaultConfigs,
-  fetchPublishedWorkflow,
-  fetchWorkflowDraft,
-  syncWorkflowDraft,
-} from '@/service/workflow'
-import type { FetchWorkflowDraftResponse } from '@/types/workflow'
 import {
   fetchAllBuiltInTools,
   fetchAllCustomTools,
+  fetchAllMCPTools,
   fetchAllWorkflowTools,
 } from '@/service/tools'
-import I18n from '@/context/i18n'
 import { CollectionType } from '@/app/components/tools/types'
 import { CUSTOM_ITERATION_START_NODE } from '@/app/components/workflow/nodes/iteration-start/constants'
+import { CUSTOM_LOOP_START_NODE } from '@/app/components/workflow/nodes/loop-start/constants'
+import { basePath } from '@/utils/var'
+import { canFindTool } from '@/utils'
+import { MAX_PARALLEL_LIMIT } from '@/config'
 
 export const useIsChatMode = () => {
   const appDetail = useAppStore(s => s.appDetail)
@@ -66,14 +57,9 @@ export const useIsChatMode = () => {
 
 export const useWorkflow = () => {
   const { t } = useTranslation()
-  const { locale } = useContext(I18n)
   const store = useStoreApi()
   const workflowStore = useWorkflowStore()
   const nodesExtraData = useNodesExtraData()
-  const setPanelWidth = useCallback((width: number) => {
-    localStorage.setItem('workflow-node-panel-width', `${width}`)
-    workflowStore.setState({ panelWidth: width })
-  }, [workflowStore])
 
   const getTreeLeafNodes = useCallback((nodeId: string) => {
     const {
@@ -85,7 +71,7 @@ export const useWorkflow = () => {
     const currentNode = nodes.find(node => node.id === nodeId)
 
     if (currentNode?.parentId)
-      startNode = nodes.find(node => node.parentId === currentNode.parentId && node.type === CUSTOM_ITERATION_START_NODE)
+      startNode = nodes.find(node => node.parentId === currentNode.parentId && (node.type === CUSTOM_ITERATION_START_NODE || node.type === CUSTOM_LOOP_START_NODE))
 
     if (!startNode)
       return []
@@ -114,7 +100,7 @@ export const useWorkflow = () => {
 
     list.push(...incomers)
 
-    return uniqBy(list, 'id').filter((item) => {
+    return uniqBy(list, 'id').filter((item: Node) => {
       return SUPPORT_OUTPUT_VARS_NODE.includes(item.data.type)
     })
   }, [store])
@@ -161,7 +147,7 @@ export const useWorkflow = () => {
 
     const length = list.length
     if (length) {
-      return uniqBy(list, 'id').reverse().filter((item) => {
+      return uniqBy(list, 'id').reverse().filter((item: Node) => {
         return SUPPORT_OUTPUT_VARS_NODE.includes(item.data.type)
       })
     }
@@ -235,6 +221,42 @@ export const useWorkflow = () => {
     return nodes.filter(node => node.parentId === nodeId)
   }, [store])
 
+  const getLoopNodeChildren = useCallback((nodeId: string) => {
+    const {
+      getNodes,
+    } = store.getState()
+    const nodes = getNodes()
+
+    return nodes.filter(node => node.parentId === nodeId)
+  }, [store])
+
+  const isFromStartNode = useCallback((nodeId: string) => {
+    const { getNodes } = store.getState()
+    const nodes = getNodes()
+    const currentNode = nodes.find(node => node.id === nodeId)
+
+    if (!currentNode)
+      return false
+
+    if (currentNode.data.type === BlockEnum.Start)
+      return true
+
+    const checkPreviousNodes = (node: Node) => {
+      const previousNodes = getBeforeNodeById(node.id)
+
+      for (const prevNode of previousNodes) {
+        if (prevNode.data.type === BlockEnum.Start)
+          return true
+        if (checkPreviousNodes(prevNode))
+          return true
+      }
+
+      return false
+    }
+
+    return checkPreviousNodes(currentNode)
+  }, [store, getBeforeNodeById])
+
   const handleOutVarRenameChange = useCallback((nodeId: string, oldValeSelector: ValueSelector, newVarSelector: ValueSelector) => {
     const { getNodes, setNodes } = store.getState()
     const afterNodes = getAfterNodesInSameBranch(nodeId)
@@ -248,8 +270,6 @@ export const useWorkflow = () => {
       })
       setNodes(newNodes)
     }
-
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [store])
 
   const isVarUsedInNodes = useCallback((varSelector: ValueSelector) => {
@@ -288,9 +308,9 @@ export const useWorkflow = () => {
       edges,
     } = store.getState()
     const connectedEdges = edges.filter(edge => edge.source === nodeId && edge.sourceHandle === nodeHandle)
-    if (connectedEdges.length > PARALLEL_LIMIT - 1) {
+    if (connectedEdges.length > MAX_PARALLEL_LIMIT - 1) {
       const { setShowTips } = workflowStore.getState()
-      setShowTips(t('workflow.common.parallelTip.limit', { num: PARALLEL_LIMIT }))
+      setShowTips(t('workflow.common.parallelTip.limit', { num: MAX_PARALLEL_LIMIT }))
       return false
     }
 
@@ -302,6 +322,7 @@ export const useWorkflow = () => {
       parallelList,
       hasAbnormalEdges,
     } = getParallelInfo(nodes, edges, parentNodeId)
+    const { workflowConfig } = workflowStore.getState()
 
     if (hasAbnormalEdges)
       return false
@@ -309,9 +330,9 @@ export const useWorkflow = () => {
     for (let i = 0; i < parallelList.length; i++) {
       const parallel = parallelList[i]
 
-      if (parallel.depth > PARALLEL_DEPTH_LIMIT) {
+      if (parallel.depth > (workflowConfig?.parallel_depth_limit || PARALLEL_DEPTH_LIMIT)) {
         const { setShowTips } = workflowStore.getState()
-        setShowTips(t('workflow.common.parallelTip.depthLimit', { num: PARALLEL_DEPTH_LIMIT }))
+        setShowTips(t('workflow.common.parallelTip.depthLimit', { num: (workflowConfig?.parallel_depth_limit || PARALLEL_DEPTH_LIMIT) }))
         return false
       }
     }
@@ -365,10 +386,6 @@ export const useWorkflow = () => {
     return !hasCycle(targetNode)
   }, [store, nodesExtraData, checkParallelLimit])
 
-  const formatTimeFromNow = useCallback((time: number) => {
-    return dayjs(time).locale(locale === 'zh-Hans' ? 'zh-cn' : locale).fromNow()
-  }, [locale])
-
   const getNode = useCallback((nodeId?: string) => {
     const { getNodes } = store.getState()
     const nodes = getNodes()
@@ -377,7 +394,6 @@ export const useWorkflow = () => {
   }, [store])
 
   return {
-    setPanelWidth,
     getTreeLeafNodes,
     getBeforeNodesInSameBranch,
     getBeforeNodesInSameBranchIncludeParent,
@@ -389,10 +405,11 @@ export const useWorkflow = () => {
     checkParallelLimit,
     checkNestedParallelLimit,
     isValidConnection,
-    formatTimeFromNow,
+    isFromStartNode,
     getNode,
     getBeforeNodeById,
     getIterationNodeChildren,
+    getLoopNodeChildren,
   }
 }
 
@@ -403,6 +420,12 @@ export const useFetchToolsData = () => {
     if (type === 'builtin') {
       const buildInTools = await fetchAllBuiltInTools()
 
+      if (basePath) {
+        buildInTools.forEach((item) => {
+          if (typeof item.icon == 'string' && !item.icon.includes(basePath))
+            item.icon = `${basePath}${item.icon}`
+        })
+      }
       workflowStore.setState({
         buildInTools: buildInTools || [],
       })
@@ -421,109 +444,17 @@ export const useFetchToolsData = () => {
         workflowTools: workflowTools || [],
       })
     }
+    if(type === 'mcp') {
+      const mcpTools = await fetchAllMCPTools()
+
+      workflowStore.setState({
+        mcpTools: mcpTools || [],
+      })
+    }
   }, [workflowStore])
 
   return {
     handleFetchAllTools,
-  }
-}
-
-export const useWorkflowInit = () => {
-  const workflowStore = useWorkflowStore()
-  const {
-    nodes: nodesTemplate,
-    edges: edgesTemplate,
-  } = useWorkflowTemplate()
-  const { handleFetchAllTools } = useFetchToolsData()
-  const appDetail = useAppStore(state => state.appDetail)!
-  const setSyncWorkflowDraftHash = useStore(s => s.setSyncWorkflowDraftHash)
-  const [data, setData] = useState<FetchWorkflowDraftResponse>()
-  const [isLoading, setIsLoading] = useState(true)
-  workflowStore.setState({ appId: appDetail.id })
-
-  const handleGetInitialWorkflowData = useCallback(async () => {
-    try {
-      const res = await fetchWorkflowDraft(`/apps/${appDetail.id}/workflows/draft`)
-      setData(res)
-      workflowStore.setState({
-        envSecrets: (res.environment_variables || []).filter(env => env.value_type === 'secret').reduce((acc, env) => {
-          acc[env.id] = env.value
-          return acc
-        }, {} as Record<string, string>),
-        environmentVariables: res.environment_variables?.map(env => env.value_type === 'secret' ? { ...env, value: '[__HIDDEN__]' } : env) || [],
-        // #TODO chatVar sync#
-        conversationVariables: res.conversation_variables || [],
-      })
-      setSyncWorkflowDraftHash(res.hash)
-      setIsLoading(false)
-    }
-    catch (error: any) {
-      if (error && error.json && !error.bodyUsed && appDetail) {
-        error.json().then((err: any) => {
-          if (err.code === 'draft_workflow_not_exist') {
-            workflowStore.setState({ notInitialWorkflow: true })
-            syncWorkflowDraft({
-              url: `/apps/${appDetail.id}/workflows/draft`,
-              params: {
-                graph: {
-                  nodes: nodesTemplate,
-                  edges: edgesTemplate,
-                },
-                features: {
-                  retriever_resource: { enabled: true },
-                },
-                environment_variables: [],
-                conversation_variables: [],
-              },
-            }).then((res) => {
-              workflowStore.getState().setDraftUpdatedAt(res.updated_at)
-              handleGetInitialWorkflowData()
-            })
-          }
-        })
-      }
-    }
-  }, [appDetail, nodesTemplate, edgesTemplate, workflowStore, setSyncWorkflowDraftHash])
-
-  useEffect(() => {
-    handleGetInitialWorkflowData()
-  }, [])
-
-  const handleFetchPreloadData = useCallback(async () => {
-    try {
-      const nodesDefaultConfigsData = await fetchNodesDefaultConfigs(`/apps/${appDetail?.id}/workflows/default-workflow-block-configs`)
-      const publishedWorkflow = await fetchPublishedWorkflow(`/apps/${appDetail?.id}/workflows/publish`)
-      workflowStore.setState({
-        nodesDefaultConfigs: nodesDefaultConfigsData.reduce((acc, block) => {
-          if (!acc[block.type])
-            acc[block.type] = { ...block.config }
-          return acc
-        }, {} as Record<string, any>),
-      })
-      workflowStore.getState().setPublishedAt(publishedWorkflow?.created_at)
-    }
-    catch (e) {
-
-    }
-  }, [workflowStore, appDetail])
-
-  useEffect(() => {
-    handleFetchPreloadData()
-    handleFetchAllTools('builtin')
-    handleFetchAllTools('custom')
-    handleFetchAllTools('workflow')
-  }, [handleFetchPreloadData, handleFetchAllTools])
-
-  useEffect(() => {
-    if (data) {
-      workflowStore.getState().setDraftUpdatedAt(data.updated_at)
-      workflowStore.getState().setToolPublished(data.tool_published)
-    }
-  }, [data, workflowStore])
-
-  return {
-    data,
-    isLoading,
   }
 }
 
@@ -566,18 +497,24 @@ export const useToolIcon = (data: Node['data']) => {
   const buildInTools = useStore(s => s.buildInTools)
   const customTools = useStore(s => s.customTools)
   const workflowTools = useStore(s => s.workflowTools)
+  const mcpTools = useStore(s => s.mcpTools)
+
   const toolIcon = useMemo(() => {
+    if(!data)
+      return ''
     if (data.type === BlockEnum.Tool) {
       let targetTools = buildInTools
       if (data.provider_type === CollectionType.builtIn)
         targetTools = buildInTools
       else if (data.provider_type === CollectionType.custom)
         targetTools = customTools
+      else if (data.provider_type === CollectionType.mcp)
+        targetTools = mcpTools
       else
         targetTools = workflowTools
-      return targetTools.find(toolWithProvider => toolWithProvider.id === data.provider_id)?.icon
+      return targetTools.find(toolWithProvider => canFindTool(toolWithProvider.id, data.provider_id))?.icon
     }
-  }, [data, buildInTools, customTools, workflowTools])
+  }, [data, buildInTools, customTools, mcpTools, workflowTools])
 
   return toolIcon
 }
@@ -602,5 +539,28 @@ export const useIsNodeInIteration = (iterationId: string) => {
   }, [iterationId, store])
   return {
     isNodeInIteration,
+  }
+}
+
+export const useIsNodeInLoop = (loopId: string) => {
+  const store = useStoreApi()
+
+  const isNodeInLoop = useCallback((nodeId: string) => {
+    const {
+      getNodes,
+    } = store.getState()
+    const nodes = getNodes()
+    const node = nodes.find(node => node.id === nodeId)
+
+    if (!node)
+      return false
+
+    if (node.parentId === loopId)
+      return true
+
+    return false
+  }, [loopId, store])
+  return {
+    isNodeInLoop,
   }
 }

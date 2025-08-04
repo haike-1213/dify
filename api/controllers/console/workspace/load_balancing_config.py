@@ -2,8 +2,7 @@ from flask_restful import Resource, reqparse
 from werkzeug.exceptions import Forbidden
 
 from controllers.console import api
-from controllers.console.setup import setup_required
-from controllers.console.wraps import account_initialization_required
+from controllers.console.wraps import account_initialization_required, setup_required
 from core.model_runtime.entities.model_entities import ModelType
 from core.model_runtime.errors.validate import CredentialsValidateFailedError
 from libs.login import current_user, login_required
@@ -16,7 +15,7 @@ class LoadBalancingCredentialsValidateApi(Resource):
     @login_required
     @account_initialization_required
     def post(self, provider: str):
-        if not TenantAccountRole.is_privileged_role(current_user.current_tenant.current_role):
+        if not TenantAccountRole.is_privileged_role(current_user.current_role):
             raise Forbidden()
 
         tenant_id = current_user.current_tenant_id
@@ -38,7 +37,7 @@ class LoadBalancingCredentialsValidateApi(Resource):
         model_load_balancing_service = ModelLoadBalancingService()
 
         result = True
-        error = None
+        error = ""
 
         try:
             model_load_balancing_service.validate_load_balancing_credentials(
@@ -65,7 +64,7 @@ class LoadBalancingConfigCredentialsValidateApi(Resource):
     @login_required
     @account_initialization_required
     def post(self, provider: str, config_id: str):
-        if not TenantAccountRole.is_privileged_role(current_user.current_tenant.current_role):
+        if not TenantAccountRole.is_privileged_role(current_user.current_role):
             raise Forbidden()
 
         tenant_id = current_user.current_tenant_id
@@ -87,7 +86,7 @@ class LoadBalancingConfigCredentialsValidateApi(Resource):
         model_load_balancing_service = ModelLoadBalancingService()
 
         result = True
-        error = None
+        error = ""
 
         try:
             model_load_balancing_service.validate_load_balancing_credentials(
@@ -113,10 +112,10 @@ class LoadBalancingConfigCredentialsValidateApi(Resource):
 # Load Balancing Config
 api.add_resource(
     LoadBalancingCredentialsValidateApi,
-    "/workspaces/current/model-providers/<string:provider>/models/load-balancing-configs/credentials-validate",
+    "/workspaces/current/model-providers/<path:provider>/models/load-balancing-configs/credentials-validate",
 )
 
 api.add_resource(
     LoadBalancingConfigCredentialsValidateApi,
-    "/workspaces/current/model-providers/<string:provider>/models/load-balancing-configs/<string:config_id>/credentials-validate",
+    "/workspaces/current/model-providers/<path:provider>/models/load-balancing-configs/<string:config_id>/credentials-validate",
 )

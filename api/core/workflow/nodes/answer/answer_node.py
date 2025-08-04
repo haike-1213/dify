@@ -1,7 +1,9 @@
 from collections.abc import Mapping, Sequence
-from typing import Any, cast
+from typing import Any, Optional, cast
 
-from core.workflow.entities.node_entities import NodeRunResult, NodeType
+from core.variables import ArrayFileSegment, FileSegment
+from core.workflow.entities.node_entities import NodeRunResult
+from core.workflow.entities.workflow_node_execution import WorkflowNodeExecutionStatus
 from core.workflow.nodes.answer.answer_stream_generate_router import AnswerStreamGeneratorRouter
 from core.workflow.nodes.answer.entities import (
     AnswerNodeData,
@@ -9,56 +11,84 @@ from core.workflow.nodes.answer.entities import (
     TextGenerateRouteChunk,
     VarGenerateRouteChunk,
 )
-from core.workflow.nodes.base_node import BaseNode
+from core.workflow.nodes.base import BaseNode
+from core.workflow.nodes.base.entities import BaseNodeData, RetryConfig
+from core.workflow.nodes.enums import ErrorStrategy, NodeType
 from core.workflow.utils.variable_template_parser import VariableTemplateParser
-from models.workflow import WorkflowNodeExecutionStatus
 
 
 class AnswerNode(BaseNode):
-    _node_data_cls = AnswerNodeData
-    _node_type: NodeType = NodeType.ANSWER
+    _node_type = NodeType.ANSWER
+
+    _node_data: AnswerNodeData
+
+    def init_node_data(self, data: Mapping[str, Any]) -> None:
+        self._node_data = AnswerNodeData.model_validate(data)
+
+    def _get_error_strategy(self) -> Optional[ErrorStrategy]:
+        return self._node_data.error_strategy
+
+    def _get_retry_config(self) -> RetryConfig:
+        return self._node_data.retry_config
+
+    def _get_title(self) -> str:
+        return self._node_data.title
+
+    def _get_description(self) -> Optional[str]:
+        return self._node_data.desc
+
+    def _get_default_value_dict(self) -> dict[str, Any]:
+        return self._node_data.default_value_dict
+
+    def get_base_node_data(self) -> BaseNodeData:
+        return self._node_data
+
+    @classmethod
+    def version(cls) -> str:
+        return "1"
 
     def _run(self) -> NodeRunResult:
         """
         Run node
         :return:
         """
-        node_data = self.node_data
-        node_data = cast(AnswerNodeData, node_data)
-
         # generate routes
-        generate_routes = AnswerStreamGeneratorRouter.extract_generate_route_from_node_data(node_data)
+        generate_routes = AnswerStreamGeneratorRouter.extract_generate_route_from_node_data(self._node_data)
 
         answer = ""
+        files = []
         for part in generate_routes:
             if part.type == GenerateRouteChunk.ChunkType.VAR:
                 part = cast(VarGenerateRouteChunk, part)
                 value_selector = part.value_selector
-                value = self.graph_runtime_state.variable_pool.get(value_selector)
-
-                if value:
-                    answer += value.markdown
+                variable = self.graph_runtime_state.variable_pool.get(value_selector)
+                if variable:
+                    if isinstance(variable, FileSegment):
+                        files.append(variable.value)
+                    elif isinstance(variable, ArrayFileSegment):
+                        files.extend(variable.value)
+                    answer += variable.markdown
             else:
                 part = cast(TextGenerateRouteChunk, part)
                 answer += part.text
 
-        return NodeRunResult(status=WorkflowNodeExecutionStatus.SUCCEEDED, outputs={"answer": answer})
+        return NodeRunResult(
+            status=WorkflowNodeExecutionStatus.SUCCEEDED,
+            outputs={"answer": answer, "files": ArrayFileSegment(value=files)},
+        )
 
     @classmethod
     def _extract_variable_selector_to_variable_mapping(
-        cls, graph_config: Mapping[str, Any], node_id: str, node_data: AnswerNodeData
+        cls,
+        *,
+        graph_config: Mapping[str, Any],
+        node_id: str,
+        node_data: Mapping[str, Any],
     ) -> Mapping[str, Sequence[str]]:
-        """
-        Extract variable selector to variable mapping
-        :param graph_config: graph config
-        :param node_id: node id
-        :param node_data: node data
-        :return:
-        """
-        node_data = node_data
-        node_data = cast(AnswerNodeData, node_data)
+        # Create typed NodeData from dict
+        typed_node_data = AnswerNodeData.model_validate(node_data)
 
-        variable_template_parser = VariableTemplateParser(template=node_data.answer)
+        variable_template_parser = VariableTemplateParser(template=typed_node_data.answer)
         variable_selectors = variable_template_parser.extract_variable_selectors()
 
         variable_mapping = {}

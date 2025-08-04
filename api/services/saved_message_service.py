@@ -13,9 +13,11 @@ class SavedMessageService:
     def pagination_by_last_id(
         cls, app_model: App, user: Optional[Union[Account, EndUser]], last_id: Optional[str], limit: int
     ) -> InfiniteScrollPagination:
+        if not user:
+            raise ValueError("User is required")
         saved_messages = (
             db.session.query(SavedMessage)
-            .filter(
+            .where(
                 SavedMessage.app_id == app_model.id,
                 SavedMessage.created_by_role == ("account" if isinstance(user, Account) else "end_user"),
                 SavedMessage.created_by == user.id,
@@ -31,9 +33,11 @@ class SavedMessageService:
 
     @classmethod
     def save(cls, app_model: App, user: Optional[Union[Account, EndUser]], message_id: str):
+        if not user:
+            return
         saved_message = (
             db.session.query(SavedMessage)
-            .filter(
+            .where(
                 SavedMessage.app_id == app_model.id,
                 SavedMessage.message_id == message_id,
                 SavedMessage.created_by_role == ("account" if isinstance(user, Account) else "end_user"),
@@ -59,9 +63,11 @@ class SavedMessageService:
 
     @classmethod
     def delete(cls, app_model: App, user: Optional[Union[Account, EndUser]], message_id: str):
+        if not user:
+            return
         saved_message = (
             db.session.query(SavedMessage)
-            .filter(
+            .where(
                 SavedMessage.app_id == app_model.id,
                 SavedMessage.message_id == message_id,
                 SavedMessage.created_by_role == ("account" if isinstance(user, Account) else "end_user"),

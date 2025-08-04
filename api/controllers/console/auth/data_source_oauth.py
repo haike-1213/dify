@@ -11,15 +11,14 @@ from controllers.console import api
 from libs.login import login_required
 from libs.oauth_data_source import NotionOAuth
 
-from ..setup import setup_required
-from ..wraps import account_initialization_required
+from ..wraps import account_initialization_required, setup_required
 
 
 def get_oauth_providers():
     with current_app.app_context():
         notion_oauth = NotionOAuth(
-            client_id=dify_config.NOTION_CLIENT_ID,
-            client_secret=dify_config.NOTION_CLIENT_SECRET,
+            client_id=dify_config.NOTION_CLIENT_ID or "",
+            client_secret=dify_config.NOTION_CLIENT_SECRET or "",
             redirect_uri=dify_config.CONSOLE_API_URL + "/console/api/oauth/data-source/callback/notion",
         )
 
@@ -35,7 +34,6 @@ class OAuthDataSource(Resource):
         OAUTH_DATASOURCE_PROVIDERS = get_oauth_providers()
         with current_app.app_context():
             oauth_provider = OAUTH_DATASOURCE_PROVIDERS.get(provider)
-            print(vars(oauth_provider))
         if not oauth_provider:
             return {"error": "Invalid provider"}, 400
         if dify_config.NOTION_INTEGRATION_TYPE == "internal":
@@ -43,7 +41,7 @@ class OAuthDataSource(Resource):
             if not internal_secret:
                 return ({"error": "Internal secret is not set"},)
             oauth_provider.save_internal_access_token(internal_secret)
-            return {"data": ""}
+            return {"data": "internal"}
         else:
             auth_url = oauth_provider.get_authorization_url()
             return {"data": auth_url}, 200
@@ -76,12 +74,14 @@ class OAuthDataSourceBinding(Resource):
         if not oauth_provider:
             return {"error": "Invalid provider"}, 400
         if "code" in request.args:
-            code = request.args.get("code")
+            code = request.args.get("code", "")
+            if not code:
+                return {"error": "Invalid code"}, 400
             try:
                 oauth_provider.get_access_token(code)
             except requests.exceptions.HTTPError as e:
                 logging.exception(
-                    f"An error occurred during the OAuthCallback process with {provider}: {e.response.text}"
+                    "An error occurred during the OAuthCallback process with %s: %s", provider, e.response.text
                 )
                 return {"error": "OAuth data source process failed"}, 400
 
@@ -103,7 +103,9 @@ class OAuthDataSourceSync(Resource):
         try:
             oauth_provider.sync_data_source(binding_id)
         except requests.exceptions.HTTPError as e:
-            logging.exception(f"An error occurred during the OAuthCallback process with {provider}: {e.response.text}")
+            logging.exception(
+                "An error occurred during the OAuthCallback process with %s: %s", provider, e.response.text
+            )
             return {"error": "OAuth data source process failed"}, 400
 
         return {"result": "success"}, 200

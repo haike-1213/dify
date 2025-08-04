@@ -3,6 +3,7 @@ import logging
 
 import requests
 from flask_restful import Resource, reqparse
+from packaging import version
 
 from configs import dify_config
 
@@ -17,7 +18,7 @@ class VersionApi(Resource):
         check_update_url = dify_config.CHECK_UPDATE_URL
 
         result = {
-            "version": dify_config.CURRENT_VERSION,
+            "version": dify_config.project.version,
             "release_date": "",
             "release_notes": "",
             "can_auto_update": False,
@@ -33,16 +34,29 @@ class VersionApi(Resource):
         try:
             response = requests.get(check_update_url, {"current_version": args.get("current_version")})
         except Exception as error:
-            logging.warning("Check update version error: {}.".format(str(error)))
+            logging.warning("Check update version error: %s.", str(error))
             result["version"] = args.get("current_version")
             return result
 
         content = json.loads(response.content)
-        result["version"] = content["version"]
-        result["release_date"] = content["releaseDate"]
-        result["release_notes"] = content["releaseNotes"]
-        result["can_auto_update"] = content["canAutoUpdate"]
+        if _has_new_version(latest_version=content["version"], current_version=f"{args.get('current_version')}"):
+            result["version"] = content["version"]
+            result["release_date"] = content["releaseDate"]
+            result["release_notes"] = content["releaseNotes"]
+            result["can_auto_update"] = content["canAutoUpdate"]
         return result
+
+
+def _has_new_version(*, latest_version: str, current_version: str) -> bool:
+    try:
+        latest = version.parse(latest_version)
+        current = version.parse(current_version)
+
+        # Compare versions
+        return latest > current
+    except version.InvalidVersion:
+        logging.warning("Invalid version format: latest=%s, current=%s", latest_version, current_version)
+        return False
 
 
 api.add_resource(VersionApi, "/version")

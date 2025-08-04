@@ -1,30 +1,36 @@
+import contextvars
 import logging
 import queue
 import time
 import uuid
 from collections.abc import Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor, wait
-from typing import Any, Optional
+from copy import copy, deepcopy
+from datetime import UTC, datetime
+from typing import Any, Optional, cast
 
 from flask import Flask, current_app
 
-from core.app.apps.base_app_queue_manager import GenerateTaskStoppedError
+from configs import dify_config
+from core.app.apps.exc import GenerateTaskStoppedError
 from core.app.entities.app_invoke_entities import InvokeFrom
-from core.workflow.entities.node_entities import (
-    NodeRunMetadataKey,
-    NodeType,
-    UserFrom,
-)
+from core.workflow.entities.node_entities import AgentNodeStrategyInit, NodeRunResult
 from core.workflow.entities.variable_pool import VariablePool, VariableValue
+from core.workflow.entities.workflow_node_execution import WorkflowNodeExecutionMetadataKey, WorkflowNodeExecutionStatus
 from core.workflow.graph_engine.condition_handlers.condition_manager import ConditionManager
 from core.workflow.graph_engine.entities.event import (
+    BaseAgentEvent,
     BaseIterationEvent,
+    BaseLoopEvent,
     GraphEngineEvent,
     GraphRunFailedEvent,
+    GraphRunPartialSucceededEvent,
     GraphRunStartedEvent,
     GraphRunSucceededEvent,
+    NodeRunExceptionEvent,
     NodeRunFailedEvent,
     NodeRunRetrieverResourceEvent,
+    NodeRunRetryEvent,
     NodeRunStartedEvent,
     NodeRunStreamChunkEvent,
     NodeRunSucceededEvent,
@@ -36,26 +42,37 @@ from core.workflow.graph_engine.entities.graph import Graph, GraphEdge
 from core.workflow.graph_engine.entities.graph_init_params import GraphInitParams
 from core.workflow.graph_engine.entities.graph_runtime_state import GraphRuntimeState
 from core.workflow.graph_engine.entities.runtime_route_state import RouteNodeState
+from core.workflow.nodes import NodeType
+from core.workflow.nodes.agent.agent_node import AgentNode
+from core.workflow.nodes.agent.entities import AgentNodeData
 from core.workflow.nodes.answer.answer_stream_processor import AnswerStreamProcessor
-from core.workflow.nodes.base_node import BaseNode
+from core.workflow.nodes.answer.base_stream_processor import StreamProcessor
+from core.workflow.nodes.base import BaseNode
 from core.workflow.nodes.end.end_stream_processor import EndStreamProcessor
+from core.workflow.nodes.enums import ErrorStrategy, FailBranchSourceHandle
 from core.workflow.nodes.event import RunCompletedEvent, RunRetrieverResourceEvent, RunStreamChunkEvent
-from core.workflow.nodes.node_mapping import node_classes
-from extensions.ext_database import db
-from models.workflow import WorkflowNodeExecutionStatus, WorkflowType
+from core.workflow.utils import variable_utils
+from libs.flask_utils import preserve_flask_contexts
+from models.enums import UserFrom
+from models.workflow import WorkflowType
 
 logger = logging.getLogger(__name__)
 
 
 class GraphEngineThreadPool(ThreadPoolExecutor):
     def __init__(
-        self, max_workers=None, thread_name_prefix="", initializer=None, initargs=(), max_submit_count=100
+        self,
+        max_workers=None,
+        thread_name_prefix="",
+        initializer=None,
+        initargs=(),
+        max_submit_count=dify_config.MAX_SUBMIT_COUNT,
     ) -> None:
         super().__init__(max_workers, thread_name_prefix, initializer, initargs)
         self.max_submit_count = max_submit_count
         self.submit_count = 0
 
-    def submit(self, fn, *args, **kwargs):
+    def submit(self, fn, /, *args, **kwargs):
         self.submit_count += 1
         self.check_is_full()
 
@@ -65,7 +82,6 @@ class GraphEngineThreadPool(ThreadPoolExecutor):
         self.submit_count -= 1
 
     def check_is_full(self) -> None:
-        print(f"submit_count: {self.submit_count}, max_submit_count: {self.max_submit_count}")
         if self.submit_count > self.max_submit_count:
             raise ValueError(f"Max submit count {self.max_submit_count} of workflow thread pool reached.")
 
@@ -85,12 +101,12 @@ class GraphEngine:
         call_depth: int,
         graph: Graph,
         graph_config: Mapping[str, Any],
-        variable_pool: VariablePool,
+        graph_runtime_state: GraphRuntimeState,
         max_execution_steps: int,
         max_execution_time: int,
         thread_pool_id: Optional[str] = None,
     ) -> None:
-        thread_pool_max_submit_count = 100
+        thread_pool_max_submit_count = dify_config.MAX_SUBMIT_COUNT
         thread_pool_max_workers = 10
 
         # init thread pool
@@ -122,7 +138,7 @@ class GraphEngine:
             call_depth=call_depth,
         )
 
-        self.graph_runtime_state = GraphRuntimeState(variable_pool=variable_pool, start_at=time.perf_counter())
+        self.graph_runtime_state = graph_runtime_state
 
         self.max_execution_steps = max_execution_steps
         self.max_execution_time = max_execution_time
@@ -130,31 +146,36 @@ class GraphEngine:
     def run(self) -> Generator[GraphEngineEvent, None, None]:
         # trigger graph run start event
         yield GraphRunStartedEvent()
+        handle_exceptions: list[str] = []
+        stream_processor: StreamProcessor
 
         try:
-            stream_processor_cls: type[AnswerStreamProcessor | EndStreamProcessor]
             if self.init_params.workflow_type == WorkflowType.CHAT:
-                stream_processor_cls = AnswerStreamProcessor
+                stream_processor = AnswerStreamProcessor(
+                    graph=self.graph, variable_pool=self.graph_runtime_state.variable_pool
+                )
             else:
-                stream_processor_cls = EndStreamProcessor
-
-            stream_processor = stream_processor_cls(
-                graph=self.graph, variable_pool=self.graph_runtime_state.variable_pool
-            )
+                stream_processor = EndStreamProcessor(
+                    graph=self.graph, variable_pool=self.graph_runtime_state.variable_pool
+                )
 
             # run graph
-            generator = stream_processor.process(self._run(start_node_id=self.graph.root_node_id))
-
+            generator = stream_processor.process(
+                self._run(start_node_id=self.graph.root_node_id, handle_exceptions=handle_exceptions)
+            )
             for item in generator:
                 try:
                     yield item
                     if isinstance(item, NodeRunFailedEvent):
-                        yield GraphRunFailedEvent(error=item.route_node_state.failed_reason or "Unknown error.")
+                        yield GraphRunFailedEvent(
+                            error=item.route_node_state.failed_reason or "Unknown error.",
+                            exceptions_count=len(handle_exceptions),
+                        )
                         return
                     elif isinstance(item, NodeRunSucceededEvent):
                         if item.node_type == NodeType.END:
                             self.graph_runtime_state.outputs = (
-                                item.route_node_state.node_run_result.outputs
+                                dict(item.route_node_state.node_run_result.outputs)
                                 if item.route_node_state.node_run_result
                                 and item.route_node_state.node_run_result.outputs
                                 else {}
@@ -174,20 +195,25 @@ class GraphEngine:
                                 "answer"
                             ].strip()
                 except Exception as e:
-                    logger.exception(f"Graph run failed: {str(e)}")
-                    yield GraphRunFailedEvent(error=str(e))
+                    logger.exception("Graph run failed")
+                    yield GraphRunFailedEvent(error=str(e), exceptions_count=len(handle_exceptions))
                     return
-
-            # trigger graph run success event
-            yield GraphRunSucceededEvent(outputs=self.graph_runtime_state.outputs)
+            # count exceptions to determine partial success
+            if len(handle_exceptions) > 0:
+                yield GraphRunPartialSucceededEvent(
+                    exceptions_count=len(handle_exceptions), outputs=self.graph_runtime_state.outputs
+                )
+            else:
+                # trigger graph run success event
+                yield GraphRunSucceededEvent(outputs=self.graph_runtime_state.outputs)
             self._release_thread()
         except GraphRunFailedError as e:
-            yield GraphRunFailedEvent(error=e.error)
+            yield GraphRunFailedEvent(error=e.error, exceptions_count=len(handle_exceptions))
             self._release_thread()
             return
         except Exception as e:
             logger.exception("Unknown Error when graph running")
-            yield GraphRunFailedEvent(error=str(e))
+            yield GraphRunFailedEvent(error=str(e), exceptions_count=len(handle_exceptions))
             self._release_thread()
             raise e
 
@@ -201,6 +227,7 @@ class GraphEngine:
         in_parallel_id: Optional[str] = None,
         parent_parallel_id: Optional[str] = None,
         parent_parallel_start_node_id: Optional[str] = None,
+        handle_exceptions: list[str] = [],
     ) -> Generator[GraphEngineEvent, None, None]:
         parallel_start_node_id = None
         if in_parallel_id:
@@ -211,13 +238,13 @@ class GraphEngine:
         while True:
             # max steps reached
             if self.graph_runtime_state.node_run_steps > self.max_execution_steps:
-                raise GraphRunFailedError("Max steps {} reached.".format(self.max_execution_steps))
+                raise GraphRunFailedError(f"Max steps {self.max_execution_steps} reached.")
 
             # or max execution time reached
             if self._is_timed_out(
                 start_at=self.graph_runtime_state.start_at, max_execution_time=self.max_execution_time
             ):
-                raise GraphRunFailedError("Max execution time {}s reached.".format(self.max_execution_time))
+                raise GraphRunFailedError(f"Max execution time {self.max_execution_time}s reached.")
 
             # init route node state
             route_node_state = self.graph_runtime_state.node_run_state.create_node_state(node_id=next_node_id)
@@ -229,15 +256,18 @@ class GraphEngine:
                 raise GraphRunFailedError(f"Node {node_id} config not found.")
 
             # convert to specific node
-            node_type = NodeType.value_of(node_config.get("data", {}).get("type"))
-            node_cls = node_classes.get(node_type)
-            if not node_cls:
-                raise GraphRunFailedError(f"Node {node_id} type {node_type} not found.")
+            node_type = NodeType(node_config.get("data", {}).get("type"))
+            node_version = node_config.get("data", {}).get("version", "1")
+
+            # Import here to avoid circular import
+            from core.workflow.nodes.node_mapping import NODE_TYPE_CLASSES_MAPPING
+
+            node_cls = NODE_TYPE_CLASSES_MAPPING[node_type][node_version]
 
             previous_node_id = previous_route_node_state.node_id if previous_route_node_state else None
 
             # init workflow run state
-            node_instance = node_cls(  # type: ignore
+            node = node_cls(
                 id=route_node_state.id,
                 config=node_config,
                 graph_init_params=self.init_params,
@@ -246,16 +276,17 @@ class GraphEngine:
                 previous_node_id=previous_node_id,
                 thread_pool_id=self.thread_pool_id,
             )
-
+            node.init_node_data(node_config.get("data", {}))
             try:
                 # run node
                 generator = self._run_node(
-                    node_instance=node_instance,
+                    node=node,
                     route_node_state=route_node_state,
                     parallel_id=in_parallel_id,
                     parallel_start_node_id=parallel_start_node_id,
                     parent_parallel_id=parent_parallel_id,
                     parent_parallel_start_node_id=parent_parallel_start_node_id,
+                    handle_exceptions=handle_exceptions,
                 )
 
                 for item in generator:
@@ -277,15 +308,16 @@ class GraphEngine:
                 route_node_state.failed_reason = str(e)
                 yield NodeRunFailedEvent(
                     error=str(e),
-                    id=node_instance.id,
+                    id=node.id,
                     node_id=next_node_id,
                     node_type=node_type,
-                    node_data=node_instance.node_data,
+                    node_data=node.get_base_node_data(),
                     route_node_state=route_node_state,
                     parallel_id=in_parallel_id,
                     parallel_start_node_id=parallel_start_node_id,
                     parent_parallel_id=parent_parallel_id,
                     parent_parallel_start_node_id=parent_parallel_start_node_id,
+                    node_version=node.version(),
                 )
                 raise e
 
@@ -305,7 +337,12 @@ class GraphEngine:
 
             if len(edge_mappings) == 1:
                 edge = edge_mappings[0]
-
+                if (
+                    previous_route_node_state.status == RouteNodeState.Status.EXCEPTION
+                    and node.error_strategy == ErrorStrategy.FAIL_BRANCH
+                    and edge.run_condition is None
+                ):
+                    break
                 if edge.run_condition:
                     result = ConditionManager.get_condition_handler(
                         init_params=self.init_params,
@@ -325,7 +362,7 @@ class GraphEngine:
 
                 if any(edge.run_condition for edge in edge_mappings):
                     # if nodes has run conditions, get node id which branch to take based on the run condition results
-                    condition_edge_mappings = {}
+                    condition_edge_mappings: dict[str, list[GraphEdge]] = {}
                     for edge in edge_mappings:
                         if edge.run_condition:
                             run_condition_hash = edge.run_condition.hash
@@ -338,7 +375,10 @@ class GraphEngine:
                         if len(sub_edge_mappings) == 0:
                             continue
 
-                        edge = sub_edge_mappings[0]
+                        edge = cast(GraphEdge, sub_edge_mappings[0])
+                        if edge.run_condition is None:
+                            logger.warning("Edge %s run condition is None", edge.target_node_id)
+                            continue
 
                         result = ConditionManager.get_condition_handler(
                             init_params=self.init_params,
@@ -359,13 +399,14 @@ class GraphEngine:
                                 edge_mappings=sub_edge_mappings,
                                 in_parallel_id=in_parallel_id,
                                 parallel_start_node_id=parallel_start_node_id,
+                                handle_exceptions=handle_exceptions,
                             )
 
-                            for item in parallel_generator:
-                                if isinstance(item, str):
-                                    final_node_id = item
+                            for parallel_result in parallel_generator:
+                                if isinstance(parallel_result, str):
+                                    final_node_id = parallel_result
                                 else:
-                                    yield item
+                                    yield parallel_result
 
                         break
 
@@ -373,18 +414,25 @@ class GraphEngine:
                         break
 
                     next_node_id = final_node_id
+                elif (
+                    node.continue_on_error
+                    and node.error_strategy == ErrorStrategy.FAIL_BRANCH
+                    and previous_route_node_state.status == RouteNodeState.Status.EXCEPTION
+                ):
+                    break
                 else:
                     parallel_generator = self._run_parallel_branches(
                         edge_mappings=edge_mappings,
                         in_parallel_id=in_parallel_id,
                         parallel_start_node_id=parallel_start_node_id,
+                        handle_exceptions=handle_exceptions,
                     )
 
-                    for item in parallel_generator:
-                        if isinstance(item, str):
-                            final_node_id = item
+                    for generated_item in parallel_generator:
+                        if isinstance(generated_item, str):
+                            final_node_id = generated_item
                         else:
-                            yield item
+                            yield generated_item
 
                     if not final_node_id:
                         break
@@ -399,6 +447,7 @@ class GraphEngine:
         edge_mappings: list[GraphEdge],
         in_parallel_id: Optional[str] = None,
         parallel_start_node_id: Optional[str] = None,
+        handle_exceptions: list[str] = [],
     ) -> Generator[GraphEngineEvent | str, None, None]:
         # if nodes has no run conditions, parallel run all nodes
         parallel_id = self.graph.node_parallel_mapping.get(edge_mappings[0].target_node_id)
@@ -438,10 +487,12 @@ class GraphEngine:
                 **{
                     "flask_app": current_app._get_current_object(),  # type: ignore[attr-defined]
                     "q": q,
+                    "context": contextvars.copy_context(),
                     "parallel_id": parallel_id,
                     "parallel_start_node_id": edge.target_node_id,
                     "parent_parallel_id": in_parallel_id,
                     "parent_parallel_start_node_id": parallel_start_node_id,
+                    "handle_exceptions": handle_exceptions,
                 },
             )
 
@@ -457,7 +508,7 @@ class GraphEngine:
                     break
 
                 yield event
-                if event.parallel_id == parallel_id:
+                if not isinstance(event, BaseAgentEvent) and event.parallel_id == parallel_id:
                     if isinstance(event, ParallelBranchRunSucceededEvent):
                         succeeded_count += 1
                         if succeeded_count == len(futures):
@@ -480,16 +531,19 @@ class GraphEngine:
     def _run_parallel_node(
         self,
         flask_app: Flask,
+        context: contextvars.Context,
         q: queue.Queue,
         parallel_id: str,
         parallel_start_node_id: str,
         parent_parallel_id: Optional[str] = None,
         parent_parallel_start_node_id: Optional[str] = None,
+        handle_exceptions: list[str] = [],
     ) -> None:
         """
         Run parallel nodes
         """
-        with flask_app.app_context():
+
+        with preserve_flask_contexts(flask_app, context_vars=context):
             try:
                 q.put(
                     ParallelBranchRunStartedEvent(
@@ -506,6 +560,7 @@ class GraphEngine:
                     in_parallel_id=parallel_id,
                     parent_parallel_id=parent_parallel_id,
                     parent_parallel_start_node_id=parent_parallel_start_node_id,
+                    handle_exceptions=handle_exceptions,
                 )
 
                 for item in generator:
@@ -541,165 +596,260 @@ class GraphEngine:
                         error=str(e),
                     )
                 )
-            finally:
-                db.session.remove()
 
     def _run_node(
         self,
-        node_instance: BaseNode,
+        node: BaseNode,
         route_node_state: RouteNodeState,
         parallel_id: Optional[str] = None,
         parallel_start_node_id: Optional[str] = None,
         parent_parallel_id: Optional[str] = None,
         parent_parallel_start_node_id: Optional[str] = None,
+        handle_exceptions: list[str] = [],
     ) -> Generator[GraphEngineEvent, None, None]:
         """
         Run node
         """
         # trigger node run start event
+        agent_strategy = (
+            AgentNodeStrategyInit(
+                name=cast(AgentNodeData, node.get_base_node_data()).agent_strategy_name,
+                icon=cast(AgentNode, node).agent_strategy_icon,
+            )
+            if node.type_ == NodeType.AGENT
+            else None
+        )
         yield NodeRunStartedEvent(
-            id=node_instance.id,
-            node_id=node_instance.node_id,
-            node_type=node_instance.node_type,
-            node_data=node_instance.node_data,
+            id=node.id,
+            node_id=node.node_id,
+            node_type=node.type_,
+            node_data=node.get_base_node_data(),
             route_node_state=route_node_state,
-            predecessor_node_id=node_instance.previous_node_id,
+            predecessor_node_id=node.previous_node_id,
             parallel_id=parallel_id,
             parallel_start_node_id=parallel_start_node_id,
             parent_parallel_id=parent_parallel_id,
             parent_parallel_start_node_id=parent_parallel_start_node_id,
+            agent_strategy=agent_strategy,
+            node_version=node.version(),
         )
 
-        db.session.close()
-
-        try:
-            # run node
-            generator = node_instance.run()
-            for item in generator:
-                if isinstance(item, GraphEngineEvent):
-                    if isinstance(item, BaseIterationEvent):
+        max_retries = node.retry_config.max_retries
+        retry_interval = node.retry_config.retry_interval_seconds
+        retries = 0
+        should_continue_retry = True
+        while should_continue_retry and retries <= max_retries:
+            try:
+                # run node
+                retry_start_at = datetime.now(UTC).replace(tzinfo=None)
+                # yield control to other threads
+                time.sleep(0.001)
+                event_stream = node.run()
+                for event in event_stream:
+                    if isinstance(event, GraphEngineEvent):
                         # add parallel info to iteration event
-                        item.parallel_id = parallel_id
-                        item.parallel_start_node_id = parallel_start_node_id
-                        item.parent_parallel_id = parent_parallel_id
-                        item.parent_parallel_start_node_id = parent_parallel_start_node_id
+                        if isinstance(event, BaseIterationEvent | BaseLoopEvent):
+                            event.parallel_id = parallel_id
+                            event.parallel_start_node_id = parallel_start_node_id
+                            event.parent_parallel_id = parent_parallel_id
+                            event.parent_parallel_start_node_id = parent_parallel_start_node_id
+                        yield event
+                    else:
+                        if isinstance(event, RunCompletedEvent):
+                            run_result = event.run_result
+                            if run_result.status == WorkflowNodeExecutionStatus.FAILED:
+                                if (
+                                    retries == max_retries
+                                    and node.type_ == NodeType.HTTP_REQUEST
+                                    and run_result.outputs
+                                    and not node.continue_on_error
+                                ):
+                                    run_result.status = WorkflowNodeExecutionStatus.SUCCEEDED
+                                if node.retry and retries < max_retries:
+                                    retries += 1
+                                    route_node_state.node_run_result = run_result
+                                    yield NodeRunRetryEvent(
+                                        id=str(uuid.uuid4()),
+                                        node_id=node.node_id,
+                                        node_type=node.type_,
+                                        node_data=node.get_base_node_data(),
+                                        route_node_state=route_node_state,
+                                        predecessor_node_id=node.previous_node_id,
+                                        parallel_id=parallel_id,
+                                        parallel_start_node_id=parallel_start_node_id,
+                                        parent_parallel_id=parent_parallel_id,
+                                        parent_parallel_start_node_id=parent_parallel_start_node_id,
+                                        error=run_result.error or "Unknown error",
+                                        retry_index=retries,
+                                        start_at=retry_start_at,
+                                        node_version=node.version(),
+                                    )
+                                    time.sleep(retry_interval)
+                                    break
+                            route_node_state.set_finished(run_result=run_result)
 
-                    yield item
-                else:
-                    if isinstance(item, RunCompletedEvent):
-                        run_result = item.run_result
-                        route_node_state.set_finished(run_result=run_result)
-
-                        if run_result.status == WorkflowNodeExecutionStatus.FAILED:
-                            yield NodeRunFailedEvent(
-                                error=route_node_state.failed_reason or "Unknown error.",
-                                id=node_instance.id,
-                                node_id=node_instance.node_id,
-                                node_type=node_instance.node_type,
-                                node_data=node_instance.node_data,
-                                route_node_state=route_node_state,
-                                parallel_id=parallel_id,
-                                parallel_start_node_id=parallel_start_node_id,
-                                parent_parallel_id=parent_parallel_id,
-                                parent_parallel_start_node_id=parent_parallel_start_node_id,
-                            )
-                        elif run_result.status == WorkflowNodeExecutionStatus.SUCCEEDED:
-                            if run_result.metadata and run_result.metadata.get(NodeRunMetadataKey.TOTAL_TOKENS):
-                                # plus state total_tokens
-                                self.graph_runtime_state.total_tokens += int(
-                                    run_result.metadata.get(NodeRunMetadataKey.TOTAL_TOKENS)  # type: ignore[arg-type]
-                                )
-
-                            if run_result.llm_usage:
-                                # use the latest usage
-                                self.graph_runtime_state.llm_usage += run_result.llm_usage
-
-                            # append node output variables to variable pool
-                            if run_result.outputs:
-                                for variable_key, variable_value in run_result.outputs.items():
-                                    # append variables to variable pool recursively
-                                    self._append_variables_recursively(
-                                        node_id=node_instance.node_id,
-                                        variable_key_list=[variable_key],
-                                        variable_value=variable_value,
+                            if run_result.status == WorkflowNodeExecutionStatus.FAILED:
+                                if node.continue_on_error:
+                                    # if run failed, handle error
+                                    run_result = self._handle_continue_on_error(
+                                        node,
+                                        event.run_result,
+                                        self.graph_runtime_state.variable_pool,
+                                        handle_exceptions=handle_exceptions,
+                                    )
+                                    route_node_state.node_run_result = run_result
+                                    route_node_state.status = RouteNodeState.Status.EXCEPTION
+                                    if run_result.outputs:
+                                        for variable_key, variable_value in run_result.outputs.items():
+                                            # append variables to variable pool recursively
+                                            self._append_variables_recursively(
+                                                node_id=node.node_id,
+                                                variable_key_list=[variable_key],
+                                                variable_value=variable_value,
+                                            )
+                                    yield NodeRunExceptionEvent(
+                                        error=run_result.error or "System Error",
+                                        id=node.id,
+                                        node_id=node.node_id,
+                                        node_type=node.type_,
+                                        node_data=node.get_base_node_data(),
+                                        route_node_state=route_node_state,
+                                        parallel_id=parallel_id,
+                                        parallel_start_node_id=parallel_start_node_id,
+                                        parent_parallel_id=parent_parallel_id,
+                                        parent_parallel_start_node_id=parent_parallel_start_node_id,
+                                        node_version=node.version(),
+                                    )
+                                    should_continue_retry = False
+                                else:
+                                    yield NodeRunFailedEvent(
+                                        error=route_node_state.failed_reason or "Unknown error.",
+                                        id=node.id,
+                                        node_id=node.node_id,
+                                        node_type=node.type_,
+                                        node_data=node.get_base_node_data(),
+                                        route_node_state=route_node_state,
+                                        parallel_id=parallel_id,
+                                        parallel_start_node_id=parallel_start_node_id,
+                                        parent_parallel_id=parent_parallel_id,
+                                        parent_parallel_start_node_id=parent_parallel_start_node_id,
+                                        node_version=node.version(),
+                                    )
+                                should_continue_retry = False
+                            elif run_result.status == WorkflowNodeExecutionStatus.SUCCEEDED:
+                                if (
+                                    node.continue_on_error
+                                    and self.graph.edge_mapping.get(node.node_id)
+                                    and node.error_strategy is ErrorStrategy.FAIL_BRANCH
+                                ):
+                                    run_result.edge_source_handle = FailBranchSourceHandle.SUCCESS
+                                if run_result.metadata and run_result.metadata.get(
+                                    WorkflowNodeExecutionMetadataKey.TOTAL_TOKENS
+                                ):
+                                    # plus state total_tokens
+                                    self.graph_runtime_state.total_tokens += int(
+                                        run_result.metadata.get(WorkflowNodeExecutionMetadataKey.TOTAL_TOKENS)  # type: ignore[arg-type]
                                     )
 
-                            # add parallel info to run result metadata
-                            if parallel_id and parallel_start_node_id:
+                                if run_result.llm_usage:
+                                    # use the latest usage
+                                    self.graph_runtime_state.llm_usage += run_result.llm_usage
+
+                                # append node output variables to variable pool
+                                if run_result.outputs:
+                                    for variable_key, variable_value in run_result.outputs.items():
+                                        # append variables to variable pool recursively
+                                        self._append_variables_recursively(
+                                            node_id=node.node_id,
+                                            variable_key_list=[variable_key],
+                                            variable_value=variable_value,
+                                        )
+
+                                # When setting metadata, convert to dict first
                                 if not run_result.metadata:
                                     run_result.metadata = {}
 
-                                run_result.metadata[NodeRunMetadataKey.PARALLEL_ID] = parallel_id
-                                run_result.metadata[NodeRunMetadataKey.PARALLEL_START_NODE_ID] = parallel_start_node_id
-                                if parent_parallel_id and parent_parallel_start_node_id:
-                                    run_result.metadata[NodeRunMetadataKey.PARENT_PARALLEL_ID] = parent_parallel_id
-                                    run_result.metadata[NodeRunMetadataKey.PARENT_PARALLEL_START_NODE_ID] = (
-                                        parent_parallel_start_node_id
+                                if parallel_id and parallel_start_node_id:
+                                    metadata_dict = dict(run_result.metadata)
+                                    metadata_dict[WorkflowNodeExecutionMetadataKey.PARALLEL_ID] = parallel_id
+                                    metadata_dict[WorkflowNodeExecutionMetadataKey.PARALLEL_START_NODE_ID] = (
+                                        parallel_start_node_id
                                     )
+                                    if parent_parallel_id and parent_parallel_start_node_id:
+                                        metadata_dict[WorkflowNodeExecutionMetadataKey.PARENT_PARALLEL_ID] = (
+                                            parent_parallel_id
+                                        )
+                                        metadata_dict[
+                                            WorkflowNodeExecutionMetadataKey.PARENT_PARALLEL_START_NODE_ID
+                                        ] = parent_parallel_start_node_id
+                                    run_result.metadata = metadata_dict
 
-                            yield NodeRunSucceededEvent(
-                                id=node_instance.id,
-                                node_id=node_instance.node_id,
-                                node_type=node_instance.node_type,
-                                node_data=node_instance.node_data,
+                                yield NodeRunSucceededEvent(
+                                    id=node.id,
+                                    node_id=node.node_id,
+                                    node_type=node.type_,
+                                    node_data=node.get_base_node_data(),
+                                    route_node_state=route_node_state,
+                                    parallel_id=parallel_id,
+                                    parallel_start_node_id=parallel_start_node_id,
+                                    parent_parallel_id=parent_parallel_id,
+                                    parent_parallel_start_node_id=parent_parallel_start_node_id,
+                                    node_version=node.version(),
+                                )
+                                should_continue_retry = False
+
+                            break
+                        elif isinstance(event, RunStreamChunkEvent):
+                            yield NodeRunStreamChunkEvent(
+                                id=node.id,
+                                node_id=node.node_id,
+                                node_type=node.type_,
+                                node_data=node.get_base_node_data(),
+                                chunk_content=event.chunk_content,
+                                from_variable_selector=event.from_variable_selector,
                                 route_node_state=route_node_state,
                                 parallel_id=parallel_id,
                                 parallel_start_node_id=parallel_start_node_id,
                                 parent_parallel_id=parent_parallel_id,
                                 parent_parallel_start_node_id=parent_parallel_start_node_id,
+                                node_version=node.version(),
                             )
-
-                        break
-                    elif isinstance(item, RunStreamChunkEvent):
-                        yield NodeRunStreamChunkEvent(
-                            id=node_instance.id,
-                            node_id=node_instance.node_id,
-                            node_type=node_instance.node_type,
-                            node_data=node_instance.node_data,
-                            chunk_content=item.chunk_content,
-                            from_variable_selector=item.from_variable_selector,
-                            route_node_state=route_node_state,
-                            parallel_id=parallel_id,
-                            parallel_start_node_id=parallel_start_node_id,
-                            parent_parallel_id=parent_parallel_id,
-                            parent_parallel_start_node_id=parent_parallel_start_node_id,
-                        )
-                    elif isinstance(item, RunRetrieverResourceEvent):
-                        yield NodeRunRetrieverResourceEvent(
-                            id=node_instance.id,
-                            node_id=node_instance.node_id,
-                            node_type=node_instance.node_type,
-                            node_data=node_instance.node_data,
-                            retriever_resources=item.retriever_resources,
-                            context=item.context,
-                            route_node_state=route_node_state,
-                            parallel_id=parallel_id,
-                            parallel_start_node_id=parallel_start_node_id,
-                            parent_parallel_id=parent_parallel_id,
-                            parent_parallel_start_node_id=parent_parallel_start_node_id,
-                        )
-        except GenerateTaskStoppedError:
-            # trigger node run failed event
-            route_node_state.status = RouteNodeState.Status.FAILED
-            route_node_state.failed_reason = "Workflow stopped."
-            yield NodeRunFailedEvent(
-                error="Workflow stopped.",
-                id=node_instance.id,
-                node_id=node_instance.node_id,
-                node_type=node_instance.node_type,
-                node_data=node_instance.node_data,
-                route_node_state=route_node_state,
-                parallel_id=parallel_id,
-                parallel_start_node_id=parallel_start_node_id,
-                parent_parallel_id=parent_parallel_id,
-                parent_parallel_start_node_id=parent_parallel_start_node_id,
-            )
-            return
-        except Exception as e:
-            logger.exception(f"Node {node_instance.node_data.title} run failed: {str(e)}")
-            raise e
-        finally:
-            db.session.close()
+                        elif isinstance(event, RunRetrieverResourceEvent):
+                            yield NodeRunRetrieverResourceEvent(
+                                id=node.id,
+                                node_id=node.node_id,
+                                node_type=node.type_,
+                                node_data=node.get_base_node_data(),
+                                retriever_resources=event.retriever_resources,
+                                context=event.context,
+                                route_node_state=route_node_state,
+                                parallel_id=parallel_id,
+                                parallel_start_node_id=parallel_start_node_id,
+                                parent_parallel_id=parent_parallel_id,
+                                parent_parallel_start_node_id=parent_parallel_start_node_id,
+                                node_version=node.version(),
+                            )
+            except GenerateTaskStoppedError:
+                # trigger node run failed event
+                route_node_state.status = RouteNodeState.Status.FAILED
+                route_node_state.failed_reason = "Workflow stopped."
+                yield NodeRunFailedEvent(
+                    error="Workflow stopped.",
+                    id=node.id,
+                    node_id=node.node_id,
+                    node_type=node.type_,
+                    node_data=node.get_base_node_data(),
+                    route_node_state=route_node_state,
+                    parallel_id=parallel_id,
+                    parallel_start_node_id=parallel_start_node_id,
+                    parent_parallel_id=parent_parallel_id,
+                    parent_parallel_start_node_id=parent_parallel_start_node_id,
+                    node_version=node.version(),
+                )
+                return
+            except Exception as e:
+                logger.exception("Node %s run failed", node.title)
+                raise e
 
     def _append_variables_recursively(self, node_id: str, variable_key_list: list[str], variable_value: VariableValue):
         """
@@ -709,16 +859,12 @@ class GraphEngine:
         :param variable_value: variable value
         :return:
         """
-        self.graph_runtime_state.variable_pool.add([node_id] + variable_key_list, variable_value)
-
-        # if variable_value is a dict, then recursively append variables
-        if isinstance(variable_value, dict):
-            for key, value in variable_value.items():
-                # construct new key list
-                new_key_list = variable_key_list + [key]
-                self._append_variables_recursively(
-                    node_id=node_id, variable_key_list=new_key_list, variable_value=value
-                )
+        variable_utils.append_variables_recursively(
+            self.graph_runtime_state.variable_pool,
+            node_id,
+            variable_key_list,
+            variable_value,
+        )
 
     def _is_timed_out(self, start_at: float, max_execution_time: int) -> bool:
         """
@@ -728,6 +874,59 @@ class GraphEngine:
         :return:
         """
         return time.perf_counter() - start_at > max_execution_time
+
+    def create_copy(self):
+        """
+        create a graph engine copy
+        :return: graph engine with a new variable pool and initialized total tokens
+        """
+        new_instance = copy(self)
+        new_instance.graph_runtime_state = copy(self.graph_runtime_state)
+        new_instance.graph_runtime_state.variable_pool = deepcopy(self.graph_runtime_state.variable_pool)
+        new_instance.graph_runtime_state.total_tokens = 0
+        return new_instance
+
+    def _handle_continue_on_error(
+        self,
+        node: BaseNode,
+        error_result: NodeRunResult,
+        variable_pool: VariablePool,
+        handle_exceptions: list[str] = [],
+    ) -> NodeRunResult:
+        # add error message and error type to variable pool
+        variable_pool.add([node.node_id, "error_message"], error_result.error)
+        variable_pool.add([node.node_id, "error_type"], error_result.error_type)
+        # add error message to handle_exceptions
+        handle_exceptions.append(error_result.error or "")
+        node_error_args: dict[str, Any] = {
+            "status": WorkflowNodeExecutionStatus.EXCEPTION,
+            "error": error_result.error,
+            "inputs": error_result.inputs,
+            "metadata": {
+                WorkflowNodeExecutionMetadataKey.ERROR_STRATEGY: node.error_strategy,
+            },
+        }
+
+        if node.error_strategy is ErrorStrategy.DEFAULT_VALUE:
+            return NodeRunResult(
+                **node_error_args,
+                outputs={
+                    **node.default_value_dict,
+                    "error_message": error_result.error,
+                    "error_type": error_result.error_type,
+                },
+            )
+        elif node.error_strategy is ErrorStrategy.FAIL_BRANCH:
+            if self.graph.edge_mapping.get(node.node_id):
+                node_error_args["edge_source_handle"] = FailBranchSourceHandle.FAILED
+            return NodeRunResult(
+                **node_error_args,
+                outputs={
+                    "error_message": error_result.error,
+                    "error_type": error_result.error_type,
+                },
+            )
+        return error_result
 
 
 class GraphRunFailedError(Exception):

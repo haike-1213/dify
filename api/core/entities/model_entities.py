@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from enum import Enum
 from typing import Optional
 
@@ -54,6 +55,25 @@ class ProviderModelWithStatusEntity(ProviderModel):
     status: ModelStatus
     load_balancing_enabled: bool = False
 
+    def raise_for_status(self) -> None:
+        """
+        Check model status and raise ValueError if not active.
+
+        :raises ValueError: When model status is not active, with a descriptive message
+        """
+        if self.status == ModelStatus.ACTIVE:
+            return
+
+        error_messages = {
+            ModelStatus.NO_CONFIGURE: "Model is not configured",
+            ModelStatus.QUOTA_EXCEEDED: "Model quota has been exceeded",
+            ModelStatus.NO_PERMISSION: "No permission to use this model",
+            ModelStatus.DISABLED: "Model is disabled",
+        }
+
+        if self.status in error_messages:
+            raise ValueError(error_messages[self.status])
+
 
 class ModelWithProviderEntity(ProviderModelWithStatusEntity):
     """
@@ -72,7 +92,7 @@ class DefaultModelProviderEntity(BaseModel):
     label: I18nObject
     icon_small: Optional[I18nObject] = None
     icon_large: Optional[I18nObject] = None
-    supported_model_types: list[ModelType]
+    supported_model_types: Sequence[ModelType] = []
 
 
 class DefaultModelEntity(BaseModel):

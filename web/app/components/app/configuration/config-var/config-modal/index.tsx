@@ -1,20 +1,26 @@
 'use client'
-import type { FC } from 'react'
-import React, { useCallback, useState } from 'react'
+import type { ChangeEvent, FC } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useContext } from 'use-context-selector'
+import produce from 'immer'
 import ModalFoot from '../modal-foot'
 import ConfigSelect from '../config-select'
 import ConfigString from '../config-string'
 import SelectTypeItem from '../select-type-item'
 import Field from './field'
+import Input from '@/app/components/base/input'
 import Toast from '@/app/components/base/toast'
-import { checkKeys, getNewVarInWorkflow } from '@/utils/var'
+import { checkKeys, getNewVarInWorkflow, replaceSpaceWithUnderscoreInVarNameInput } from '@/utils/var'
 import ConfigContext from '@/context/debug-configuration'
-import type { InputVar, MoreInfo } from '@/app/components/workflow/types'
+import type { InputVar, MoreInfo, UploadFileSetting } from '@/app/components/workflow/types'
 import Modal from '@/app/components/base/modal'
-import Switch from '@/app/components/base/switch'
-import { ChangeType, InputVarType } from '@/app/components/workflow/types'
+import { ChangeType, InputVarType, SupportUploadFileTypes } from '@/app/components/workflow/types'
+import FileUploadSetting from '@/app/components/workflow/nodes/_base/components/file-upload-setting'
+import Checkbox from '@/app/components/base/checkbox'
+import { DEFAULT_FILE_UPLOAD_SETTING } from '@/app/components/workflow/constants'
+import { DEFAULT_VALUE_MAX_LEN } from '@/config'
+import { SimpleSelect } from '@/app/components/base/select'
 
 const TEXT_MAX_LENGTH = 256
 
@@ -25,9 +31,8 @@ export type IConfigModalProps = {
   varKeys?: string[]
   onClose: () => void
   onConfirm: (newValue: InputVar, moreInfo?: MoreInfo) => void
+  supportFile?: boolean
 }
-
-const inputClassName = 'w-full px-3 text-sm leading-9 text-gray-900 border-0 rounded-lg grow h-9 bg-gray-100 focus:outline-none focus:ring-1 focus:ring-inset focus:ring-gray-200'
 
 const ConfigModal: FC<IConfigModalProps> = ({
   isCreate,
@@ -35,15 +40,22 @@ const ConfigModal: FC<IConfigModalProps> = ({
   isShow,
   onClose,
   onConfirm,
+  supportFile,
 }) => {
   const { modelConfig } = useContext(ConfigContext)
   const { t } = useTranslation()
   const [tempPayload, setTempPayload] = useState<InputVar>(payload || getNewVarInWorkflow('') as any)
   const { type, label, variable, options, max_length } = tempPayload
+  const modalRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    // To fix the first input element auto focus, then directly close modal will raise error
+    if (isShow)
+      modalRef.current?.focus()
+  }, [isShow])
 
   const isStringInput = type === InputVarType.textInput || type === InputVarType.paragraph
-  const checkVariableName = useCallback((value: string) => {
-    const { isValid, errorMessageKey } = checkKeys([value], false)
+  const checkVariableName = useCallback((value: string, canBeEmpty?: boolean) => {
+    const { isValid, errorMessageKey } = checkKeys([value], canBeEmpty)
     if (!isValid) {
       Toast.notify({
         type: 'error',
@@ -66,9 +78,28 @@ const ConfigModal: FC<IConfigModalProps> = ({
     }
   }, [])
 
+  const handleTypeChange = useCallback((type: InputVarType) => {
+    return () => {
+      const newPayload = produce(tempPayload, (draft) => {
+        draft.type = type
+        if ([InputVarType.singleFile, InputVarType.multiFiles].includes(type)) {
+          (Object.keys(DEFAULT_FILE_UPLOAD_SETTING)).forEach((key) => {
+            if (key !== 'max_length')
+              (draft as any)[key] = (DEFAULT_FILE_UPLOAD_SETTING as any)[key]
+          })
+          if (type === InputVarType.multiFiles)
+            draft.max_length = DEFAULT_FILE_UPLOAD_SETTING.max_length
+        }
+        if (type === InputVarType.paragraph)
+          draft.max_length = DEFAULT_VALUE_MAX_LEN
+      })
+      setTempPayload(newPayload)
+    }
+  }, [tempPayload])
+
   const handleVarKeyBlur = useCallback((e: any) => {
     const varName = e.target.value
-    if (!checkVariableName(varName) || tempPayload.label)
+    if (!checkVariableName(varName, true) || tempPayload.label)
       return
 
     setTempPayload((prev) => {
@@ -78,6 +109,20 @@ const ConfigModal: FC<IConfigModalProps> = ({
       }
     })
   }, [checkVariableName, tempPayload.label])
+
+  const handleVarNameChange = useCallback((e: ChangeEvent<any>) => {
+    replaceSpaceWithUnderscoreInVarNameInput(e.target)
+    const value = e.target.value
+    const { isValid, errorKey, errorMessageKey } = checkKeys([value], true)
+    if (!isValid) {
+      Toast.notify({
+        type: 'error',
+        message: t(`appDebug.varKeyError.${errorMessageKey}`, { key: errorKey }),
+      })
+      return
+    }
+    handlePayloadChange('variable')(e.target.value)
+  }, [handlePayloadChange, t])
 
   const handleConfirm = () => {
     const moreInfo = tempPayload.variable === payload?.variable
@@ -107,7 +152,7 @@ const ConfigModal: FC<IConfigModalProps> = ({
     if (isStringInput || type === InputVarType.number) {
       onConfirm(tempPayload, moreInfo)
     }
-    else {
+    else if (type === InputVarType.select) {
       if (options?.length === 0) {
         Toast.notify({ type: 'error', message: t('appDebug.variableConfig.errorMsg.atLeastOneOption') })
         return
@@ -127,6 +172,22 @@ const ConfigModal: FC<IConfigModalProps> = ({
       }
       onConfirm(tempPayload, moreInfo)
     }
+    else if ([InputVarType.singleFile, InputVarType.multiFiles].includes(type)) {
+      if (tempPayload.allowed_file_types?.length === 0) {
+        const errorMessages = t('workflow.errorMsg.fieldRequired', { field: t('appDebug.variableConfig.file.supportFileTypes') })
+        Toast.notify({ type: 'error', message: errorMessages })
+        return
+      }
+      if (tempPayload.allowed_file_types?.includes(SupportUploadFileTypes.custom) && !tempPayload.allowed_file_extensions?.length) {
+        const errorMessages = t('workflow.errorMsg.fieldRequired', { field: t('appDebug.variableConfig.file.custom.name') })
+        Toast.notify({ type: 'error', message: errorMessages })
+        return
+      }
+      onConfirm(tempPayload, moreInfo)
+    }
+    else {
+      onConfirm(tempPayload, moreInfo)
+    }
   }
 
   return (
@@ -135,32 +196,32 @@ const ConfigModal: FC<IConfigModalProps> = ({
       isShow={isShow}
       onClose={onClose}
     >
-      <div className='mb-8'>
+      <div className='mb-8' ref={modalRef} tabIndex={-1}>
         <div className='space-y-2'>
 
           <Field title={t('appDebug.variableConfig.fieldType')}>
-            <div className='flex space-x-2'>
-              <SelectTypeItem type={InputVarType.textInput} selected={type === InputVarType.textInput} onClick={() => handlePayloadChange('type')(InputVarType.textInput)} />
-              <SelectTypeItem type={InputVarType.paragraph} selected={type === InputVarType.paragraph} onClick={() => handlePayloadChange('type')(InputVarType.paragraph)} />
-              <SelectTypeItem type={InputVarType.select} selected={type === InputVarType.select} onClick={() => handlePayloadChange('type')(InputVarType.select)} />
-              <SelectTypeItem type={InputVarType.number} selected={type === InputVarType.number} onClick={() => handlePayloadChange('type')(InputVarType.number)} />
+            <div className='grid grid-cols-3 gap-2'>
+              <SelectTypeItem type={InputVarType.textInput} selected={type === InputVarType.textInput} onClick={handleTypeChange(InputVarType.textInput)} />
+              <SelectTypeItem type={InputVarType.paragraph} selected={type === InputVarType.paragraph} onClick={handleTypeChange(InputVarType.paragraph)} />
+              <SelectTypeItem type={InputVarType.select} selected={type === InputVarType.select} onClick={handleTypeChange(InputVarType.select)} />
+              <SelectTypeItem type={InputVarType.number} selected={type === InputVarType.number} onClick={handleTypeChange(InputVarType.number)} />
+              {supportFile && <>
+                <SelectTypeItem type={InputVarType.singleFile} selected={type === InputVarType.singleFile} onClick={handleTypeChange(InputVarType.singleFile)} />
+                <SelectTypeItem type={InputVarType.multiFiles} selected={type === InputVarType.multiFiles} onClick={handleTypeChange(InputVarType.multiFiles)} />
+              </>}
             </div>
           </Field>
 
           <Field title={t('appDebug.variableConfig.varName')}>
-            <input
-              type='text'
-              className={inputClassName}
+            <Input
               value={variable}
-              onChange={e => handlePayloadChange('variable')(e.target.value)}
+              onChange={handleVarNameChange}
               onBlur={handleVarKeyBlur}
               placeholder={t('appDebug.variableConfig.inputPlaceholder')!}
             />
           </Field>
           <Field title={t('appDebug.variableConfig.labelName')}>
-            <input
-              type='text'
-              className={inputClassName}
+            <Input
               value={label as string}
               onChange={e => handlePayloadChange('label')(e.target.value)}
               placeholder={t('appDebug.variableConfig.inputPlaceholder')!}
@@ -174,14 +235,50 @@ const ConfigModal: FC<IConfigModalProps> = ({
 
           )}
           {type === InputVarType.select && (
-            <Field title={t('appDebug.variableConfig.options')}>
-              <ConfigSelect options={options || []} onChange={handlePayloadChange('options')} />
-            </Field>
+            <>
+              <Field title={t('appDebug.variableConfig.options')}>
+                <ConfigSelect options={options || []} onChange={handlePayloadChange('options')} />
+              </Field>
+              {options && options.length > 0 && (
+                <Field title={t('appDebug.variableConfig.defaultValue')}>
+                  <SimpleSelect
+                    key={`default-select-${options.join('-')}`}
+                    className="w-full"
+                    optionWrapClassName="max-h-[140px] overflow-y-auto"
+                    items={[
+                      { value: '', name: t('appDebug.variableConfig.noDefaultValue') },
+                      ...options.filter(opt => opt.trim() !== '').map(option => ({
+                        value: option,
+                        name: option,
+                      })),
+                    ]}
+                    defaultValue={tempPayload.default || ''}
+                    onSelect={item => handlePayloadChange('default')(item.value === '' ? undefined : item.value)}
+                    placeholder={t('appDebug.variableConfig.selectDefaultValue')}
+                    allowSearch={false}
+                  />
+                </Field>
+              )}
+            </>
           )}
 
-          <Field title={t('appDebug.variableConfig.required')}>
-            <Switch defaultValue={tempPayload.required} onChange={handlePayloadChange('required')} />
-          </Field>
+          {[InputVarType.singleFile, InputVarType.multiFiles].includes(type) && (
+            <FileUploadSetting
+              payload={tempPayload as UploadFileSetting}
+              onChange={(p: UploadFileSetting) => setTempPayload(p as InputVar)}
+              isMultiple={type === InputVarType.multiFiles}
+            />
+          )}
+
+          <div className='!mt-5 flex h-6 items-center space-x-2'>
+            <Checkbox checked={tempPayload.required} disabled={tempPayload.hide} onCheck={() => handlePayloadChange('required')(!tempPayload.required)} />
+            <span className='system-sm-semibold text-text-secondary'>{t('appDebug.variableConfig.required')}</span>
+          </div>
+
+          <div className='!mt-5 flex h-6 items-center space-x-2'>
+            <Checkbox checked={tempPayload.hide} disabled={tempPayload.required} onCheck={() => handlePayloadChange('hide')(!tempPayload.hide)} />
+            <span className='system-sm-semibold text-text-secondary'>{t('appDebug.variableConfig.hide')}</span>
+          </div>
         </div>
       </div>
       <ModalFoot

@@ -278,7 +278,6 @@ export type WorkflowLogsRequest = {
 
 export type WorkflowRunDetailResponse = {
   id: string
-  sequence_number: number
   version: string
   graph: {
     nodes: Node[]
@@ -297,6 +296,7 @@ export type WorkflowRunDetailResponse = {
   created_by_end_user?: EndUserInfo
   created_at: number
   finished_at: number
+  exceptions_count?: number
 }
 
 export type AgentLogMeta = {

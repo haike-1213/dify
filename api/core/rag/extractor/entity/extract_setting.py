@@ -14,7 +14,7 @@ class NotionInfo(BaseModel):
     notion_workspace_id: str
     notion_obj_id: str
     notion_page_type: str
-    document: Document = None
+    document: Optional[Document] = None
     tenant_id: str
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -27,18 +27,14 @@ class WebsiteInfo(BaseModel):
     website import info.
     """
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     provider: str
     job_id: str
     url: str
     mode: str
     tenant_id: str
     only_main_content: bool = False
-
-    class Config:
-        arbitrary_types_allowed = True
-
-    def __init__(self, **data) -> None:
-        super().__init__(**data)
 
 
 class ExtractSetting(BaseModel):

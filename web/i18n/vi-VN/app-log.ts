@@ -52,6 +52,7 @@ const translation = {
     },
     variables: 'Biến',
     uploadImages: 'Ảnh đã tải lên',
+    modelParams: 'Thông số mô hình',
   },
   filter: {
     period: {
@@ -79,12 +80,12 @@ const translation = {
   runDetail: {
     title: 'Nhật ký cuộc trò chuyện',
     workflowTitle: 'Chi tiết nhật ký',
+    fileListDetail: 'Chi tiết',
+    fileListLabel: 'Chi tiết tệp',
   },
   promptLog: 'Nhật ký lời nhắc',
-  AgentLog: 'Nhật ký tác nhân',
   viewLog: 'Xem nhật ký',
   agentLogDetail: {
-    AgentMode: 'Chế độ tác nhân',
     toolUsed: 'Công cụ đã sử dụng',
     iterations: 'Số lần lặp',
     iteration: 'Lần lặp',

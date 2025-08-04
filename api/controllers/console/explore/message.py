@@ -5,8 +5,6 @@ from flask_restful import marshal_with, reqparse
 from flask_restful.inputs import int_range
 from werkzeug.exceptions import InternalServerError, NotFound
 
-import services
-from controllers.console import api
 from controllers.console.app.error import (
     AppMoreLikeThisDisabledError,
     CompletionRequestError,
@@ -30,7 +28,11 @@ from models.model import AppMode
 from services.app_generate_service import AppGenerateService
 from services.errors.app import MoreLikeThisDisabledError
 from services.errors.conversation import ConversationNotExistsError
-from services.errors.message import MessageNotExistsError, SuggestedQuestionsAfterAnswerDisabledError
+from services.errors.message import (
+    FirstMessageNotExistsError,
+    MessageNotExistsError,
+    SuggestedQuestionsAfterAnswerDisabledError,
+)
 from services.message_service import MessageService
 
 
@@ -51,11 +53,11 @@ class MessageListApi(InstalledAppResource):
 
         try:
             return MessageService.pagination_by_first_id(
-                app_model, current_user, args["conversation_id"], args["first_id"], args["limit"], "desc"
+                app_model, current_user, args["conversation_id"], args["first_id"], args["limit"]
             )
-        except services.errors.conversation.ConversationNotExistsError:
+        except ConversationNotExistsError:
             raise NotFound("Conversation Not Exists.")
-        except services.errors.message.FirstMessageNotExistsError:
+        except FirstMessageNotExistsError:
             raise NotFound("First Message Not Exists.")
 
 
@@ -67,11 +69,18 @@ class MessageFeedbackApi(InstalledAppResource):
 
         parser = reqparse.RequestParser()
         parser.add_argument("rating", type=str, choices=["like", "dislike", None], location="json")
+        parser.add_argument("content", type=str, location="json")
         args = parser.parse_args()
 
         try:
-            MessageService.create_feedback(app_model, message_id, current_user, args["rating"])
-        except services.errors.message.MessageNotExistsError:
+            MessageService.create_feedback(
+                app_model=app_model,
+                message_id=message_id,
+                user=current_user,
+                rating=args.get("rating"),
+                content=args.get("content"),
+            )
+        except MessageNotExistsError:
             raise NotFound("Message Not Exists.")
 
         return {"result": "success"}
@@ -153,21 +162,3 @@ class MessageSuggestedQuestionApi(InstalledAppResource):
             raise InternalServerError()
 
         return {"data": questions}
-
-
-api.add_resource(MessageListApi, "/installed-apps/<uuid:installed_app_id>/messages", endpoint="installed_app_messages")
-api.add_resource(
-    MessageFeedbackApi,
-    "/installed-apps/<uuid:installed_app_id>/messages/<uuid:message_id>/feedbacks",
-    endpoint="installed_app_message_feedback",
-)
-api.add_resource(
-    MessageMoreLikeThisApi,
-    "/installed-apps/<uuid:installed_app_id>/messages/<uuid:message_id>/more-like-this",
-    endpoint="installed_app_more_like_this",
-)
-api.add_resource(
-    MessageSuggestedQuestionApi,
-    "/installed-apps/<uuid:installed_app_id>/messages/<uuid:message_id>/suggested-questions",
-    endpoint="installed_app_suggested_question",
-)

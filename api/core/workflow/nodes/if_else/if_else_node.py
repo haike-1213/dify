@@ -1,28 +1,57 @@
 from collections.abc import Mapping, Sequence
-from typing import Any, cast
+from typing import Any, Literal, Optional
 
-from core.workflow.entities.node_entities import NodeRunResult, NodeType
-from core.workflow.nodes.base_node import BaseNode
+from typing_extensions import deprecated
+
+from core.workflow.entities.node_entities import NodeRunResult
+from core.workflow.entities.variable_pool import VariablePool
+from core.workflow.entities.workflow_node_execution import WorkflowNodeExecutionStatus
+from core.workflow.nodes.base import BaseNode
+from core.workflow.nodes.base.entities import BaseNodeData, RetryConfig
+from core.workflow.nodes.enums import ErrorStrategy, NodeType
 from core.workflow.nodes.if_else.entities import IfElseNodeData
+from core.workflow.utils.condition.entities import Condition
 from core.workflow.utils.condition.processor import ConditionProcessor
-from models.workflow import WorkflowNodeExecutionStatus
 
 
 class IfElseNode(BaseNode):
-    _node_data_cls = IfElseNodeData
     _node_type = NodeType.IF_ELSE
+
+    _node_data: IfElseNodeData
+
+    def init_node_data(self, data: Mapping[str, Any]) -> None:
+        self._node_data = IfElseNodeData.model_validate(data)
+
+    def _get_error_strategy(self) -> Optional[ErrorStrategy]:
+        return self._node_data.error_strategy
+
+    def _get_retry_config(self) -> RetryConfig:
+        return self._node_data.retry_config
+
+    def _get_title(self) -> str:
+        return self._node_data.title
+
+    def _get_description(self) -> Optional[str]:
+        return self._node_data.desc
+
+    def _get_default_value_dict(self) -> dict[str, Any]:
+        return self._node_data.default_value_dict
+
+    def get_base_node_data(self) -> BaseNodeData:
+        return self._node_data
+
+    @classmethod
+    def version(cls) -> str:
+        return "1"
 
     def _run(self) -> NodeRunResult:
         """
         Run node
         :return:
         """
-        node_data = self.node_data
-        node_data = cast(IfElseNodeData, node_data)
-
         node_inputs: dict[str, list] = {"conditions": []}
 
-        process_datas: dict[str, list] = {"condition_results": []}
+        process_data: dict[str, list] = {"condition_results": []}
 
         input_conditions = []
         final_result = False
@@ -30,16 +59,15 @@ class IfElseNode(BaseNode):
         condition_processor = ConditionProcessor()
         try:
             # Check if the new cases structure is used
-            if node_data.cases:
-                for case in node_data.cases:
-                    input_conditions, group_result = condition_processor.process_conditions(
-                        variable_pool=self.graph_runtime_state.variable_pool, conditions=case.conditions
+            if self._node_data.cases:
+                for case in self._node_data.cases:
+                    input_conditions, group_result, final_result = condition_processor.process_conditions(
+                        variable_pool=self.graph_runtime_state.variable_pool,
+                        conditions=case.conditions,
+                        operator=case.logical_operator,
                     )
 
-                    # Apply the logical operator for the current case
-                    final_result = all(group_result) if case.logical_operator == "and" else any(group_result)
-
-                    process_datas["condition_results"].append(
+                    process_data["condition_results"].append(
                         {
                             "group": case.model_dump(),
                             "results": group_result,
@@ -53,16 +81,18 @@ class IfElseNode(BaseNode):
                         break
 
             else:
+                # TODO: Update database then remove this
                 # Fallback to old structure if cases are not defined
-                input_conditions, group_result = condition_processor.process_conditions(
-                    variable_pool=self.graph_runtime_state.variable_pool, conditions=node_data.conditions
+                input_conditions, group_result, final_result = _should_not_use_old_function(
+                    condition_processor=condition_processor,
+                    variable_pool=self.graph_runtime_state.variable_pool,
+                    conditions=self._node_data.conditions or [],
+                    operator=self._node_data.logical_operator or "and",
                 )
-
-                final_result = all(group_result) if node_data.logical_operator == "and" else any(group_result)
 
                 selected_case_id = "true" if final_result else "false"
 
-                process_datas["condition_results"].append(
+                process_data["condition_results"].append(
                     {"group": "default", "results": group_result, "final_result": final_result}
                 )
 
@@ -70,7 +100,7 @@ class IfElseNode(BaseNode):
 
         except Exception as e:
             return NodeRunResult(
-                status=WorkflowNodeExecutionStatus.FAILED, inputs=node_inputs, process_data=process_datas, error=str(e)
+                status=WorkflowNodeExecutionStatus.FAILED, inputs=node_inputs, process_data=process_data, error=str(e)
             )
 
         outputs = {"result": final_result, "selected_case_id": selected_case_id}
@@ -78,7 +108,7 @@ class IfElseNode(BaseNode):
         data = NodeRunResult(
             status=WorkflowNodeExecutionStatus.SUCCEEDED,
             inputs=node_inputs,
-            process_data=process_datas,
+            process_data=process_data,
             edge_source_handle=selected_case_id or "false",  # Use case ID or 'default'
             outputs=outputs,
         )
@@ -87,13 +117,34 @@ class IfElseNode(BaseNode):
 
     @classmethod
     def _extract_variable_selector_to_variable_mapping(
-        cls, graph_config: Mapping[str, Any], node_id: str, node_data: IfElseNodeData
+        cls,
+        *,
+        graph_config: Mapping[str, Any],
+        node_id: str,
+        node_data: Mapping[str, Any],
     ) -> Mapping[str, Sequence[str]]:
-        """
-        Extract variable selector to variable mapping
-        :param graph_config: graph config
-        :param node_id: node id
-        :param node_data: node data
-        :return:
-        """
-        return {}
+        # Create typed NodeData from dict
+        typed_node_data = IfElseNodeData.model_validate(node_data)
+
+        var_mapping: dict[str, list[str]] = {}
+        for case in typed_node_data.cases or []:
+            for condition in case.conditions:
+                key = f"{node_id}.#{'.'.join(condition.variable_selector)}#"
+                var_mapping[key] = condition.variable_selector
+
+        return var_mapping
+
+
+@deprecated("This function is deprecated. You should use the new cases structure.")
+def _should_not_use_old_function(
+    *,
+    condition_processor: ConditionProcessor,
+    variable_pool: VariablePool,
+    conditions: list[Condition],
+    operator: Literal["and", "or"],
+):
+    return condition_processor.process_conditions(
+        variable_pool=variable_pool,
+        conditions=conditions,
+        operator=operator,
+    )
